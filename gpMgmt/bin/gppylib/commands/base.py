@@ -58,19 +58,19 @@ class WorkerPool(object):
         self.should_stop = False
         self.work_queue = Queue()
         self.completed_queue = Queue()
-        self.num_assigned = 0
+        self._assigned = 0
         self.daemonize = daemonize
+        self.logger = logger
+
         if items is not None:
             for item in items:
-                self.work_queue.put(item)
-                self.num_assigned += 1
+                self.addCommand(item)
 
         for i in range(0, numWorkers):
             w = Worker("worker%d" % i, self)
             self.workers.append(w)
             w.start()
         self.numWorkers = numWorkers
-        self.logger = logger
 
     ###
     def getNumWorkers(self):
@@ -89,29 +89,7 @@ class WorkerPool(object):
     def addCommand(self, cmd):
         self.logger.debug("Adding cmd to work_queue: %s" % cmd.cmdStr)
         self.work_queue.put(cmd)
-        self.num_assigned += 1
-
-    def wait_and_printdots(self, command_count, quiet=True):
-        while self.completed_queue.qsize() < command_count:
-            time.sleep(1)
-
-            if not quiet:
-                sys.stdout.write(".")
-                sys.stdout.flush()
-        if not quiet:
-            print " "
-        self.join()
-
-    def print_progress(self, command_count):
-        while True:
-            num_completed = self.completed_queue.qsize()
-            num_completed_percentage = 0
-            if command_count:
-                num_completed_percentage = float(num_completed) / command_count
-            self.logger.info('%0.2f%% of jobs completed' % (num_completed_percentage * 100))
-            if num_completed >= command_count:
-                return
-            self._join_work_queue_with_timeout(10)
+        self._assigned += 1
 
     def _join_work_queue_with_timeout(self, timeout):
         """
@@ -128,7 +106,7 @@ class WorkerPool(object):
             while self.work_queue.unfinished_tasks:
                 if (timeout <= 0):
                     # Timed out.
-                    return
+                    return False
 
                 start_time = time.time()
                 done_condition.wait(timeout)
@@ -136,19 +114,42 @@ class WorkerPool(object):
         finally:
             done_condition.release()
 
-    def join(self):
-        self.work_queue.join()
         return True
+
+    def join(self, timeout=None):
+        """
+        Waits (up to an optional timeout) for the worker queue to be fully
+        completed, and returns True if the pool is now done with its work.
+
+        A None timeout indicates that join() should wait forever; the return
+        value is always True in this case. Zero and negative timeouts indicate
+        that join() will query the queue status and return immediately, whether
+        the queue is done or not.
+        """
+        if timeout is None:
+            self.work_queue.join()
+            return True
+
+        return self._join_work_queue_with_timeout(timeout)
 
     def joinWorkers(self):
         for w in self.workers:
             w.join()
 
+    def _pop_completed(self):
+        """
+        Pops an item off the completed queue and decrements the assigned count.
+        If the queue is empty, throws Queue.Empty.
+        """
+        item = self.completed_queue.get(False)
+        self._assigned -= 1
+        return item
+
     def getCompletedItems(self):
         completed_list = []
         try:
             while True:
-                item = self.completed_queue.get(False)  # will throw Empty
+                item = self._pop_completed() # will throw Empty
                 if item is not None:
                     completed_list.append(item)
         except Empty:
@@ -162,7 +163,7 @@ class WorkerPool(object):
         """
         try:
             while True:
-                item = self.completed_queue.get(False)
+                item = self._pop_completed() # will throw Empty
                 if not item.get_results().wasSuccessful():
                     raise ExecutionError("Error Executing Command: ", item)
         except Empty:
@@ -170,11 +171,29 @@ class WorkerPool(object):
 
     def empty_completed_items(self):
         while not self.completed_queue.empty():
-            self.completed_queue.get(False)
+            self._pop_completed()
 
     def isDone(self):
         # TODO: not sure that qsize() is safe
-        return (self.num_assigned == self.completed_queue.qsize())
+        return (self.assigned == self.completed_queue.qsize())
+
+    @property
+    def assigned(self):
+        """
+        A read-only count of the number of commands that have been added to the
+        pool. This count is only decremented when items are removed from the
+        completed queue via getCompletedItems(), empty_completed_items(), or
+        check_results().
+        """
+        return self._assigned
+
+    @property
+    def completed(self):
+        """
+        A read-only count of the items in the completed queue. Will be reset to
+        zero after a call to empty_completed_items() or getCompletedItems().
+        """
+        return self.completed_queue.qsize()
 
     def haltWork(self):
         self.logger.debug("WorkerPool haltWork()")
@@ -182,6 +201,25 @@ class WorkerPool(object):
         for w in self.workers:
             w.haltWork()
             self.work_queue.put(self.halt_command)
+
+
+def join_and_indicate_progress(pool, outfile=sys.stdout, interval=1):
+    """
+    Waits for a WorkerPool to complete its work, flushing dots to stdout every
+    second. If any dots are printed (i.e. the work takes longer than the
+    printing interval), a newline is also printed upon completion.
+
+    The file to print to and the interval between printings can be overridden.
+    """
+    printed = False
+
+    while not pool.join(interval):
+        outfile.write('.')
+        outfile.flush()
+        printed = True
+
+    if printed:
+        outfile.write('\n')
 
 
 class OperationWorkerPool(WorkerPool):

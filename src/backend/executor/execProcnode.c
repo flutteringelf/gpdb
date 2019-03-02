@@ -23,7 +23,6 @@
  *		ExecInitNode	-		initialize a plan node and its subplans
  *		ExecProcNode	-		get a tuple by executing the plan node
  *		ExecEndNode		-		shut down a plan node and its subplans
- *		ExecSquelchNode		-	notify subtree that no more tuples are needed
  *
  *	 NOTES
  *		This used to be three files.  It is now all combined into
@@ -948,7 +947,8 @@ ExecProcNode(PlanState *node)
 		ExecReScan(node);		/* let ReScan handle this */
 
 	if (node->squelched)
-		elog(ERROR, "cannot execute squelched plan node");
+		elog(ERROR, "cannot execute squelched plan node of type: %d",
+			 (int) nodeTag(node));
 
 	if (node->instrument)
 		InstrStartNode(node->instrument);
@@ -1096,6 +1096,10 @@ ExecProcNode(PlanState *node)
 			result = ExecAgg((AggState *) node);
 			break;
 
+		case T_WindowAggState:
+			result = ExecWindowAgg((WindowAggState *) node);
+			break;
+
 		case T_UniqueState:
 			result = ExecUnique((UniqueState *) node);
 			break;
@@ -1122,10 +1126,6 @@ ExecProcNode(PlanState *node)
 
 		case T_ShareInputScanState:
 			result = ExecShareInputScan((ShareInputScanState *) node);
-			break;
-
-		case T_WindowAggState:
-			result = ExecWindowAgg((WindowAggState *) node);
 			break;
 
 		case T_RepeatState:

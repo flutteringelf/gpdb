@@ -532,9 +532,8 @@ cdbcomponent_cleanupIdleQEs(bool includeWriter)
 }
 
 /* 
- * This function is called when current global transaction is set,
- * the snapshot of segments info will not changed within a global
- * transaction
+ * This function is called when a transaction is started and the snapshot of
+ * segments info will not changed until the end of transaction
  */
 void
 cdbcomponent_updateCdbComponents(void)
@@ -1511,12 +1510,27 @@ cdbcomponent_getCdbComponentsList(void)
 int
 getgpsegmentCount(void)
 {
-	int32 numsegments = -1;
+	/* 1 represents a singleton postgresql in utility mode */
+	int32 numsegments = 1;
 
 	if (Gp_role == GP_ROLE_DISPATCH)
 		numsegments = cdbcomponent_getCdbComponents(true)->total_segments;
 	else if (Gp_role == GP_ROLE_EXECUTE)
 		numsegments = numsegmentsFromQD;
+	/*
+	 * If we are in 'Utility & Binary Upgrade' mode, it must be launched
+	 * by the pg_upgrade, so we give it an correct numsegments to make
+	 * sure the pg_upgrade can run normally.
+	 * Only Utility QD process have the entire information in the
+	 * gp_segment_configuration, so we count the segments count in this
+	 * process.
+	 */
+	else if (Gp_role == GP_ROLE_UTILITY &&
+			 IsBinaryUpgrade &&
+			 IS_QUERY_DISPATCHER())
+	{
+		numsegments = cdbcomponent_getCdbComponents(true)->total_segments;
+	}
 
 	return numsegments;
 }

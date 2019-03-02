@@ -7,6 +7,8 @@
 TODO: docs!
 """
 import os, pickle, base64, time
+import os.path
+import pipes
 
 import re, socket
 
@@ -34,6 +36,11 @@ COMMAND_NOT_FOUND=127
 
 #Default size of thread pool for gpstart and gpsegstart
 DEFAULT_GPSTART_NUM_WORKERS=64
+
+# Application name used by the pg_rewind instance that gprecoverseg starts
+# during incremental recovery. gpstate uses this to figure out when incremental
+# recovery is active.
+RECOVERY_REWIND_APPNAME = '__gprecoverseg_pg_rewind__'
 
 def get_postmaster_pid_locally(datadir):
     cmdStr = "ps -ef | grep postgres | grep -v grep | awk '{print $2}' | grep `cat %s/postmaster.pid | head -1` || echo -1" % (datadir)
@@ -132,36 +139,33 @@ class PgCtlBackendOptions(CmdArgs):
     --------
 
     >>> str(PgCtlBackendOptions(5432, 1, 2))
-    '-p 5432 --gp_dbid=1 --silent-mode=true'
+    '-p 5432 --silent-mode=true'
     >>> str(PgCtlBackendOptions(5432, 1, 2).set_master(True))
-    '-p 5432 --gp_dbid=1 --silent-mode=true -i --gp_contentid=-1'
+    '-p 5432 --silent-mode=true -i'
     >>> str(PgCtlBackendOptions(5432, 1, 2).set_master(False))
-    '-p 5432 --gp_dbid=1 --silent-mode=true -i --gp_contentid=-1 -E'
+    '-p 5432 --silent-mode=true -i -E'
     >>> str(PgCtlBackendOptions(5432, 1, 2).set_segment(1))
-    '-p 5432 --gp_dbid=1 --silent-mode=true -i --gp_contentid=1'
+    '-p 5432 --silent-mode=true -i'
     >>> str(PgCtlBackendOptions(5432, 1, 2).set_special('upgrade'))
-    '-p 5432 --gp_dbid=1 --silent-mode=true -U'
+    '-p 5432 --silent-mode=true -U'
     >>> str(PgCtlBackendOptions(5432, 1, 2).set_special('maintenance'))
-    '-p 5432 --gp_dbid=1 --silent-mode=true -m'
+    '-p 5432 --silent-mode=true -m'
     >>> str(PgCtlBackendOptions(5432, 1, 2).set_utility(True))
-    '-p 5432 --gp_dbid=1 --silent-mode=true -c gp_role=utility'
+    '-p 5432 --silent-mode=true -c gp_role=utility'
     >>> str(PgCtlBackendOptions(5432, 1, 2).set_utility(False))
-    '-p 5432 --gp_dbid=1 --silent-mode=true'
+    '-p 5432 --silent-mode=true'
     >>> str(PgCtlBackendOptions(5432, 1, 2).set_restricted(True,1))
-    '-p 5432 --gp_dbid=1 --silent-mode=true -c superuser_reserved_connections=1'
+    '-p 5432 --silent-mode=true -c superuser_reserved_connections=1'
     >>>
 
     """
 
-    def __init__(self, port, dbid, numcids):
+    def __init__(self, port):
         """
         @param port: backend port
-        @param dbid: backed dbid
-        @param numcids: total number of content ids in cluster
         """
         CmdArgs.__init__(self, [
             "-p", str(port),
-            "--gp_dbid="+ str(dbid),
         ])
 
     #
@@ -172,15 +176,7 @@ class PgCtlBackendOptions(CmdArgs):
         """
         @param is_utility_mode: start with is_utility_mode?
         """
-        self.append("--gp_contentid=-1")
         if not is_utility_mode: self.append("-E")
-        return self
-
-    def set_segment(self, content):
-        """
-        @param content: content id
-        """
-        self.append("--gp_contentid="+str(content))
         return self
 
     #
@@ -223,7 +219,7 @@ class PgCtlStartArgs(CmdArgs):
     >>> str(a).split(' ') #doctest: +NORMALIZE_WHITESPACE
     ['env', GPERA=123', '$GPHOME/bin/pg_ctl', '-D', '/data1/master/gpseg-1', '-l',
      '/data1/master/gpseg-1/pg_log/startup.log', '-w', '-t', '600',
-     '-o', '"', '-p', '5432', '--gp_dbid=1', '--silent-mode=true', '"', 'start']
+     '-o', '"', '-p', '5432', '--silent-mode=true', '"', 'start']
     """
 
     def __init__(self, datadir, backend, era, wrapper, args, wait, timeout=None):
@@ -280,7 +276,7 @@ class PgCtlStopArgs(CmdArgs):
 
 
 class MasterStart(Command):
-    def __init__(self, name, dataDir, port, dbid, numContentsInCluster, era,
+    def __init__(self, name, dataDir, port, era,
                  wrapper, wrapper_args, specialMode=None, restrictedMode=False, timeout=SEGMENT_TIMEOUT_DEFAULT,
                  max_connections=1, utilityMode=False, ctxt=LOCAL, remoteHost=None,
                  wait=True
@@ -292,7 +288,7 @@ class MasterStart(Command):
         self.wrapper_args=wrapper_args
 
         # build backend options
-        b = PgCtlBackendOptions(port, dbid, numContentsInCluster)
+        b = PgCtlBackendOptions(port)
         b.set_master(is_utility_mode=utilityMode)
         b.set_utility(utilityMode)
         b.set_special(specialMode)
@@ -305,10 +301,10 @@ class MasterStart(Command):
         Command.__init__(self, name, self.cmdStr, ctxt, remoteHost)
 
     @staticmethod
-    def local(name, dataDir, port, dbid, numContentsInCluster, era,
+    def local(name, dataDir, port, era,
               wrapper, wrapper_args, specialMode=None, restrictedMode=False, timeout=SEGMENT_TIMEOUT_DEFAULT,
               max_connections=1, utilityMode=False):
-        cmd=MasterStart(name, dataDir, port, dbid, numContentsInCluster, era,
+        cmd=MasterStart(name, dataDir, port, era,
                         wrapper, wrapper_args, specialMode, restrictedMode, timeout,
                         max_connections, utilityMode)
         cmd.run(validateAfter=True)
@@ -343,14 +339,11 @@ class SegmentStart(Command):
         self.segment = gpdb
 
         # Interesting data from our input segment
-        dbid    = gpdb.getSegmentDbId()
-        content = gpdb.getSegmentContentId()
         port    = gpdb.getSegmentPort()
         datadir = gpdb.getSegmentDataDirectory()
 
         # build backend options
-        b = PgCtlBackendOptions(port, dbid, numContentsInCluster)
-        b.set_segment(content)
+        b = PgCtlBackendOptions(port)
         b.set_utility(utilityMode)
         b.set_special(specialMode)
 
@@ -421,7 +414,11 @@ class SegmentRewind(Command):
                  verbose=False, ctxt=REMOTE):
 
         # Construct the source server libpq connection string
-        source_server = "host=%s port=%s dbname=template1" % (source_host, source_port)
+        # We set application_name here so gpstate can identify whether an
+        # incremental recovery is occurring.
+        source_server = "host={} port={} dbname=template1 application_name={}".format(
+            source_host, source_port, RECOVERY_REWIND_APPNAME
+        )
 
         # Build the pg_rewind command. Do not run pg_rewind if recovery.conf
         # file exists in target data directory because the target instance can
@@ -543,19 +540,12 @@ class GpGetSegmentStatusValues(Command):
 
 SEGSTART_ERROR_UNKNOWN_ERROR = -1
 SEGSTART_SUCCESS = 0
-SEGSTART_ERROR_MIRRORING_FAILURE = 1
-SEGSTART_ERROR_POSTMASTER_DIED = 2
-SEGSTART_ERROR_INVALID_STATE_TRANSITION = 3
-SEGSTART_ERROR_SERVER_IS_IN_SHUTDOWN = 4
 SEGSTART_ERROR_STOP_RUNNING_SEGMENT_FAILED = 5
 SEGSTART_ERROR_DATA_DIRECTORY_DOES_NOT_EXIST = 6
-SEGSTART_ERROR_SERVER_DID_NOT_RESPOND = 7
 SEGSTART_ERROR_PG_CTL_FAILED = 8
-SEGSTART_ERROR_CHECKING_CONNECTION_AND_LOCALE_FAILED = 9
 SEGSTART_ERROR_PING_FAILED = 10 # not actually done inside GpSegStartCmd, done instead by caller
 SEGSTART_ERROR_PG_CONTROLDATA_FAILED = 11
 SEGSTART_ERROR_CHECKSUM_MISMATCH = 12
-SEGSTART_ERROR_OTHER = 1000
 
 
 class GpSegStartArgs(CmdArgs):
@@ -683,15 +673,13 @@ class GpStandbyStart(MasterStart, object):
     The standby will be up as dispatch mode, and could be in remote.
     """
 
-    def __init__(self, name, datadir, port, ncontents, ctxt=LOCAL,
-                 remoteHost=None, dbid=None, era=None,
+    def __init__(self, name, datadir, port, ctxt=LOCAL,
+                 remoteHost=None, era=None,
                  wrapper=None, wrapper_args=None):
         super(GpStandbyStart, self).__init__(
                 name=name,
                 dataDir=datadir,
                 port=port,
-                dbid=dbid,
-                numContentsInCluster=ncontents,
                 era=era,
                 wrapper=wrapper,
                 wrapper_args=wrapper_args,
@@ -701,19 +689,19 @@ class GpStandbyStart(MasterStart, object):
                 )
 
     @staticmethod
-    def local(name, datadir, port, ncontents, dbid, era=None,
+    def local(name, datadir, port, era=None,
               wrapper=None, wrapper_args=None):
-        cmd = GpStandbyStart(name, datadir, port, ncontents,
-                             dbid=dbid, era=era,
+        cmd = GpStandbyStart(name, datadir, port,
+                             era=era,
                              wrapper=wrapper, wrapper_args=wrapper_args)
         cmd.run(validateAfter=True)
         return cmd
 
     @staticmethod
-    def remote(name, host, datadir, port, ncontents, dbid, era=None,
+    def remote(name, host, datadir, port, era=None,
                wrapper=None, wrapper_args=None):
-        cmd = GpStandbyStart(name, datadir, port, ncontents, ctxt=REMOTE,
-                             remoteHost=host, dbid=dbid, era=era,
+        cmd = GpStandbyStart(name, datadir, port, ctxt=REMOTE,
+                             remoteHost=host, era=era,
                              wrapper=wrapper, wrapper_args=wrapper_args)
         cmd.run(validateAfter=True)
         return cmd
@@ -815,7 +803,7 @@ class GpStop(Command):
         return cmd
 
 #-----------------------------------------------
-class ModifyPostgresqlConfSetting(Command):
+class ModifyConfSetting(Command):
     def __init__(self, name, file, optName, optVal, optType='string', ctxt=LOCAL, remoteHost=None):
         cmdStr = None
         if optType == 'number':
@@ -823,7 +811,7 @@ class ModifyPostgresqlConfSetting(Command):
         elif optType == 'string':
             cmdStr = "perl -i -p -e \"s/^%s[ ]*=[ ]*'[^']*'/%s='%s'/\" %s" % (optName, optName, optVal, file)
         else:
-            raise Exception, "Invalid optType for ModifyPostgresqlConfSetting"
+            raise Exception, "Invalid optType for ModifyConfSetting"
         self.cmdStr = cmdStr
         Command.__init__(self, name, self.cmdStr, ctxt, remoteHost)
 
@@ -865,10 +853,10 @@ class ConfigureNewSegment(Command):
       etc.
     """
 
-    def __init__(self, name, confinfo, newSegments=False, tarFile=None,
+    def __init__(self, name, confinfo, logdir, newSegments=False, tarFile=None,
                  batchSize=None, verbose=False,ctxt=LOCAL, remoteHost=None, validationOnly=False, writeGpIdFileOnly=False,
                  forceoverwrite=False):
-        cmdStr = '$GPHOME/bin/lib/gpconfigurenewsegment -c \"%s\"' % (confinfo)
+        cmdStr = '$GPHOME/bin/lib/gpconfigurenewsegment -c \"%s\" -l %s' % (confinfo, pipes.quote(logdir))
         if newSegments:
             cmdStr += ' -n'
         if tarFile:
@@ -935,10 +923,11 @@ class ConfigureNewSegment(Command):
                 isPrimarySegment = "false"
                 isTargetReusedLocationString = "false"
 
-            result[hostname] += '%s:%d:%s:%s:%d:%s:%s' % (seg.getSegmentDataDirectory(), seg.getSegmentPort(),
+            result[hostname] += '%s:%d:%s:%s:%d:%d:%s:%s' % (seg.getSegmentDataDirectory(), seg.getSegmentPort(),
                                                           isPrimarySegment,
                                                           isTargetReusedLocationString,
                                                           seg.getSegmentDbId(),
+                                                          seg.getSegmentContentId(),
                                                           primaryHostname,
                                                           primarySegmentPort
             )
@@ -1124,10 +1113,154 @@ def check_permissions(username):
 
 
 
+class _GpExpandStatus(object):
+    '''
+    Internal class to store gpexpand status, note it's different with the
+    GpExpandStatus class inside the gpexpand command.
+    '''
+
+    dbname = 'postgres'
+
+    # status information
+    phase = 0
+    status = 'NO EXPANSION DETECTED'
+
+    # progress information, arrays of (dbname, relname, status)
+    uncompleted = []
+    completed = []
+    inprogress = []
+
+    def _get_phase1_status(self):
+        # first assume no expansion is in progress
+        self.phase = 0
+        self.status = 'NO EXPANSION DETECTED'
+
+        datadir = get_masterdatadir()
+        filename = os.path.join(datadir, 'gpexpand.status')
+        try:
+            with open(filename, 'r') as f:
+                # it is phase1 as long as the status file exists
+                self.phase = 1
+                self.status = 'UNKNOWN PHASE1 STATUS'
+
+                lines = f.readlines()
+        except IOError:
+            return self.phase > 0
+
+        if lines and lines[-1].split(':')[0]:
+            self.status = lines[-1].split(':')[0]
+
+        return True
+
+    def _get_phase2_status(self):
+        # first assume no expansion is in progress
+        self.phase = 0
+        self.status = 'NO EXPANSION DETECTED'
+
+        sql = '''
+            SELECT status FROM gpexpand.status ORDER BY updated DESC LIMIT 1
+        '''
+
+        try:
+            dburl = dbconn.DbURL(dbname=self.dbname)
+            with dbconn.connect(dburl, encoding='UTF8') as conn:
+                status = dbconn.execSQLForSingleton(conn, sql)
+        except Exception:
+            # schema table not found
+            return False
+
+        # it is phase2 as long as the schema table exists
+        self.phase = 2
+        if status:
+            self.status = status
+        else:
+            self.status = 'UNKNOWN PHASE2 STATUS'
+        return True
+
+    def _get_phase2_progress(self):
+        self.uncompleted = []
+        self.completed = []
+        self.inprogress = []
+
+        sql = '''
+            SELECT quote_ident(dbname) AS fq_dbname, fq_name, status
+              FROM gpexpand.status_detail
+        '''
+
+        try:
+            dburl = dbconn.DbURL(dbname=self.dbname)
+            with dbconn.connect(dburl, encoding='UTF8') as conn:
+                cursor = dbconn.execSQL(conn, sql)
+                rows = cursor.fetchall()
+        except Exception:
+            return False
+
+        for row in rows:
+            _, _, status = row
+            if status == 'COMPLETED':
+                self.completed.append(row)
+            elif status == 'IN PROGRESS':
+                self.inprogress.append(row)
+            else:
+                self.uncompleted.append(row)
+
+        return True
+
+    def get_status(self):
+        '''
+        Get gpexpand status, such as whether an expansion is in progress,
+        which expansion phase it is.
+        '''
+
+        if self._get_phase1_status():
+            pass
+        elif self._get_phase2_status():
+            pass
+
+        return self
+
+    def get_progress(self):
+        '''
+        Get data redistribution progress of phase 2.
+        '''
+
+        self._get_phase2_progress()
+
+        return self
+
+def get_gpexpand_status():
+    '''
+    Get gpexpand status
+    '''
+    status = _GpExpandStatus()
+    status.get_status()
+    return status
+
+def conflict_with_gpexpand(utility, refuse_phase1=True, refuse_phase2=False):
+    '''
+    Generate error message when gpexpand is running in specified phases.
+    Some utilities can not run in parallel with gpexpand, this function can be
+    used to simplify the checks on gpexpand status.
+    '''
+    status = get_gpexpand_status()
+
+    if status.phase == 1 and refuse_phase1:
+        err_msg = ("ERROR: Usage of {utility} is not supported while the "
+                   "cluster is in a reconfiguration state, "
+                   "exit {utility}")
+        return (False, err_msg.format(utility=utility))
+
+    if status.phase == 2 and refuse_phase2:
+        err_msg = ("ERROR: Usage of {utility} is not supported while the "
+                   "cluster has tables waiting for expansion, "
+                   "exit {utility}")
+        return (False, err_msg.format(utility=utility))
+
+    return (True, "")
 
 #=-=-=-=-=-=-=-=-=-= Bash Migration Helper Functions =-=-=-=-=-=-=-=-
 
-def start_standbymaster(host, datadir, port, dbid, ncontents, era=None,
+def start_standbymaster(host, datadir, port, era=None,
                         wrapper=None, wrapper_args=None):
     logger.info("Starting standby master")
 
@@ -1145,7 +1278,7 @@ def start_standbymaster(host, datadir, port, dbid, ncontents, era=None,
         logger.warning("Unable to cleanup previously started standby: '%s'" % res)
 
     cmd = GpStandbyStart.remote('start standby master',
-                                host, datadir, port, ncontents, dbid, era=era,
+                                host, datadir, port, era=era,
                                 wrapper=wrapper, wrapper_args=wrapper_args)
     logger.debug("Starting standby: %s" % cmd )
 
@@ -1217,7 +1350,7 @@ def is_pid_postmaster(datadir, pid, remoteHost=None):
     is_postmaster = True
     if (validate_command ('pgrep', datadir, ctxt, remoteHost) and
             validate_command ('pwdx', datadir, ctxt, remoteHost)):
-        cmdStr = 'pgrep postgres | xargs -i pwdx {} | grep "%s" | grep "^%s:" | cat' % (datadir, pid)
+        cmdStr = 'pgrep postgres | xargs -I{} pwdx {} | grep "%s" | grep "^%s:" | cat' % (datadir, pid)
         cmd = Command("search for postmaster process", cmdStr, ctxt=ctxt, remoteHost=remoteHost)
         res = None
         try:
@@ -1320,13 +1453,8 @@ def chk_local_db_running(datadir, port):
         finally:
             f.close()
 
-    cmd=FileDirExists('check for /tmp/.s.PGSQL file file', "/tmp/.s.PGSQL.%d" % port)
-    cmd.run(validateAfter=True)
-    tmpfile_exists = cmd.filedir_exists()
-
-    cmd=FileDirExists('check for lock file', get_lockfile_name(port))
-    cmd.run(validateAfter=True)
-    lockfile_exists = cmd.filedir_exists()
+    tmpfile_exists = os.path.exists("/tmp/.s.PGSQL.%d" % port)
+    lockfile_exists = os.path.exists(get_lockfile_name(port))
 
     netstat_port_active = PgPortIsActive.local('check netstat for postmaster port',"/tmp/.s.PGSQL.%d" % port, port)
 
@@ -1393,36 +1521,6 @@ def createTempDirectoryName(masterDataDirectory, tempDirPrefix):
                                 tempDirPrefix,
                                 datetime.datetime.now().strftime('%m%d%Y'),
                                 os.getpid())
-
-
-#-------------------------------------------------------------------------
-# gp_dbid methods moved to gp_dbid.py, but this class was left here
-#
-
-class GpCreateDBIdFile(Command):
-    def __init__(self, name, directory, dbid, verbose=False, ctxt=LOCAL, remoteHost=None):
-        if verbose:
-            setverbose="-v"
-        else:
-            setverbose=""
-        args = [
-            "$GPHOME/sbin/gpsetdbid.py",
-            "-d %s" % directory,
-            "-i %s" % dbid,
-            setverbose,
-            ]
-        cmdStr = " ".join(args)
-        Command.__init__(self, name, cmdStr, ctxt, remoteHost)
-
-    @staticmethod
-    def local(name, directory, dbid):
-        cmd = GpCreateDBIdFile(name, directory, dbid)
-        cmd.run(validateAfter=True)
-
-    @staticmethod
-    def remote(name, remoteHost, directory, dbid):
-        cmd = GpCreateDBIdFile(name, directory, dbid, ctxt=REMOTE, remoteHost=remoteHost)
-        cmd.run(validateAfter=True)
 
 #-------------------------------------------------------------------------
 class GpRecoverSeg(Command):

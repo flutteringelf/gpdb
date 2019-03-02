@@ -17,17 +17,19 @@ Usage: gpcheckcat [<option>] [dbname]
     -C catname : run cross consistency, FK and ACL tests for this catalog table
 
 '''
+import datetime
 import getopt
+import logging
 import re
 import sys
 import time
-from datetime import datetime
 
 try:
+    from gppylib import gplog
     from gppylib.db import dbconn
-    from gppylib.gplog import *
     from gppylib.gpcatalog import *
     from gppylib.commands.unix import *
+    from gppylib.commands.gp import conflict_with_gpexpand
     from gppylib.system.info import *
     from pygresql.pgdb import DatabaseError
     from pygresql import pg
@@ -35,6 +37,7 @@ try:
     from gpcheckcat_modules.leaked_schema_dropper import LeakedSchemaDropper
     from gpcheckcat_modules.repair import Repair
     from gpcheckcat_modules.foreign_key_check import ForeignKeyCheck
+    from gpcheckcat_modules.orphaned_toast_tables_check import OrphanedToastTablesCheck, OrphanToastTableIssue, OrphanedTable
 
 
 except ImportError, e:
@@ -45,9 +48,9 @@ oidmap = {}
 
 # -------------------------------------------------------------------------------
 EXECNAME = os.path.split(__file__)[-1]
-setup_tool_logging(EXECNAME, getLocalHostname(), getUserName())
-very_quiet_stdout_logging()
-logger = get_default_logger()
+gplog.setup_tool_logging(EXECNAME, getLocalHostname(), getUserName())
+gplog.very_quiet_stdout_logging()
+logger = gplog.get_default_logger()
 
 sysinfo = SystemInfo(logger)
 
@@ -94,6 +97,8 @@ def setError(level):
 ###############################
 class Global():
     def __init__(self):
+        self.timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+
         self.retcode = SUCCESS
         self.opt = {}
         self.opt['-h'] = None
@@ -104,7 +109,7 @@ class Global():
         self.opt['-V'] = False
         self.opt['-t'] = False
 
-        self.opt['-g'] = 'gpcheckcat.repair.' + Repair.TIMESTAMP
+        self.opt['-g'] = 'gpcheckcat.repair.' + self.timestamp
         self.opt['-B'] = parallelism
         self.opt['-T'] = None
 
@@ -242,7 +247,7 @@ def parseCommandLine():
     if GV.opt['-l']: return
 
     if GV.opt['-v']:
-        enable_verbose_logging()
+        gplog.enable_verbose_logging()
 
     setdef('-P', 'PGPASSWORD')
     setdef('-U', 'PGUSER')
@@ -461,7 +466,7 @@ def checkDistribPolicy():
       join pg_class rel on (pk.conrelid = rel.oid)
       join pg_namespace n on (rel.relnamespace = n.oid)
       join gp_distribution_policy d on (rel.oid = d.localoid)
-    where pk.contype in('p', 'u') and d.policytype = 'p' and d.attrnums is null
+    where pk.contype in('p', 'u') and d.policytype = 'p' and d.distkey = ''
     '''
 
     db = connect2(GV.cfg[1])
@@ -503,8 +508,8 @@ def checkDistribPolicy():
       join  pg_namespace n on (rel.relnamespace = n.oid)
       join  gp_distribution_policy d on (rel.oid = d.localoid)
     where pk.contype in ('p', 'u') and d.policytype = 'p' and
-          (d.attrnums is null or not
-           d.attrnums operator(pg_catalog.<@) pk.conkey)
+          (d.distkey = '' or not
+           d.distkey::int2[] operator(pg_catalog.<@) pk.conkey)
     '''
     try:
         curs = db.query(qry)
@@ -626,8 +631,8 @@ def checkPartitionIntegrity():
     select
       parrelid,
       parchildrelid,
-      d1.attrnums as parpolicy,
-      d2.attrnums as parchildpolicy
+      d1.distkey as parpolicy,
+      d2.distkey as parchildpolicy
     from
       (
         select distinct
@@ -643,8 +648,8 @@ def checkPartitionIntegrity():
                      from (
                        select
                          localoid,
-                         unnest(attrnums) as offset,
-                         generate_series(1, array_upper(attrnums, 1)) as index
+                         unnest(distkey) as offset,
+                         generate_series(1, array_length(distkey, 1)) as index
                        from
                          gp_distribution_policy
                       ) d
@@ -662,8 +667,8 @@ def checkPartitionIntegrity():
                      from (
                        select
                          localoid,
-                         unnest(attrnums) as offset,
-                         generate_series(1, array_upper(attrnums, 1)) as index
+                         unnest(distkey) as offset,
+                         generate_series(1, array_length(distkey, 1)) as index
                        from
                          gp_distribution_policy
                       ) d
@@ -678,7 +683,7 @@ def checkPartitionIntegrity():
       ) p
     join gp_distribution_policy d1 on (d1.localoid = p.parrelid)
     join gp_distribution_policy d2 on (d2.localoid = p.parchildrelid)
-    where d2.attrnums is not null
+    where d2.distkey <> ''
     '''
     try:
         curs = db.query(qry)
@@ -1008,7 +1013,7 @@ partitionRegularityChecks = {
                         select
                             k.tableid,
                             d.attrcnt,
-                            d.attrnums,
+                            d.distkey,
                             sum(k.partkeylen),
                             array_agg(k.partkey[g.g])
                         from
@@ -1057,18 +1062,18 @@ partitionRegularityChecks = {
                             (
                                 select
                                     localoid::regclass,
-                                    attrnums,
-                                    coalesce(1+array_upper(attrnums,1)-array_lower(attrnums,1),0)
+                                    distkey,
+                                    array_length(distkey, 1)
                                 from
                                     gp_distribution_policy
-                            ) as d(relid, attrnums, attrcnt)
+                            ) as d(relid, distkey, attrcnt)
                         where
                             g.g < k.partkeylen and
                             k.tableid = d.relid
                         group by
                             k.tableid,
                             d.attrcnt,
-                            d.attrnums
+                            d.distkey
                     ) as k(tableid, distkeylen, distkey, partkeylen, partkey) ,
                     (
                         select
@@ -1112,7 +1117,7 @@ partitionRegularityChecks = {
                     c.relid = k.tableid and
                     i.indrelid = k.tableid and
                     i.indexrelid = c.indexid and
-                    not i.indkey::smallint[] @> array_cat(k.distkey, k.partkey)
+                    not i.indkey::smallint[] @> array_cat(k.distkey::smallint[], k.partkey)
             ) as x(tableid, distkey, partkey, conid, conname, contype, indrelid, indkey) ,
             (
                 select
@@ -2395,9 +2400,9 @@ def checkTableACL(cat):
             logger.error('  %s acl check has %d issue(s)' % (catname, nrows))
 
             fields = curs.listfields()
-            log_literal(logger, logging.ERROR, "    " + " | ".join(fields))
+            gplog.log_literal(logger, logging.ERROR, "    " + " | ".join(fields))
             for row in curs.getresult():
-                log_literal(logger, logging.ERROR, "    " + " | ".join(map(str, row)))
+                gplog.log_literal(logger, logging.ERROR, "    " + " | ".join(map(str, row)))
             processACLResult(catname, fields, curs.getresult())
 
     except Exception, e:
@@ -2528,10 +2533,10 @@ def checkTableMissingEntry(cat):
                         ('WARNING' if log_level == logging.WARNING else 'FAIL'))
             logger_with_level('  %s has %d issue(s)' % (catname, nrows))
             fields = curs.listfields()
-            log_literal(logger, log_level, "    " + " | ".join(fields))
+            gplog.log_literal(logger, log_level, "    " + " | ".join(fields))
             results = curs.getresult()
             for row in results:
-                log_literal(logger, log_level, "    " + " | ".join(map(str, row)))
+                gplog.log_literal(logger, log_level, "    " + " | ".join(map(str, row)))
             processMissingDuplicateEntryResult(catname, fields, results, "missing")
             if catname == 'pg_type':
                 generateVerifyFile(catname, fields, results, 'missing_extraneous')
@@ -2682,9 +2687,9 @@ def checkTableInconsistentEntry(cat):
             logger.error('  %s has %d issue(s)' % (catname, nrows))
 
             fields = curs.listfields()
-            log_literal(logger, logging.ERROR, "    " + " | ".join(fields))
+            gplog.log_literal(logger, logging.ERROR, "    " + " | ".join(fields))
             for row in curs.getresult():
-                log_literal(logger, logging.ERROR, "    " + " | ".join(map(str, row)))
+                gplog.log_literal(logger, logging.ERROR, "    " + " | ".join(map(str, row)))
             results = curs.getresult()
             processInconsistentEntryResult(catname, pkey, fields, results)
             if catname == 'pg_type':
@@ -2821,10 +2826,10 @@ def checkTableDuplicateEntry(cat):
             logger.error('  %s has %d issue(s)' % (catname, nrows))
 
             fields = curs.listfields()
-            log_literal(logger, logging.ERROR, "    " + " | ".join(fields))
+            gplog.log_literal(logger, logging.ERROR, "    " + " | ".join(fields))
             results = curs.getresult()
             for row in results:
-                log_literal(logger, logging.ERROR, "    " + " | ".join(map(str, row)))
+                gplog.log_literal(logger, logging.ERROR, "    " + " | ".join(map(str, row)))
             processMissingDuplicateEntryResult(catname, fields, results, "duplicate")
             if catname == 'pg_type':
                 generateVerifyFile(catname, fields, results, 'duplicate')
@@ -2903,6 +2908,59 @@ def log_unique_index_violations(violations):
             ))
 
     logger.error('\n'.join(log_output))
+
+
+# -------------------------------------------------------------------------------
+def checkOrphanedToastTables():
+    logger.info('-----------------------------------')
+    logger.info('Performing check: checking for orphaned TOAST tables')
+
+    db_connection = connect2(GV.cfg[1], utilityMode=False)
+    checker = OrphanedToastTablesCheck()
+    check_passed = checker.runCheck(db_connection)
+
+    checkname = 'orphaned toast table(s)'
+    if check_passed:
+        logger.info('[OK]  %s' % checkname)
+    else:
+        logger.info('[FAIL]  %s' % checkname)
+        GV.checkStatus = False
+        setError(ERROR_REMOVE)
+
+        # log raw orphan toast table query results only to the log file
+        log_output = ['Orphan toast tables detected for the following scenarios:']
+        for issue_type in checker.issue_types():
+            log_output.append('\n' + issue_type.header)
+            log_output.append('content_id | toast_table_oid | toast_table_name | expected_table_oid | expected_table_name | dependent_table_oid | dependent_table_name')
+            log_output.append('-----------+-----------------+------------------+--------------------+---------------------+---------------------+---------------------')
+            for row in checker.rows_of_type(issue_type):
+                log_output.append('{} | {} | {} | {} | {} | {} | {}'.format(
+                    row['content_id'],
+                    row['toast_table_oid'],
+                    row['toast_table_name'],
+                    row['expected_table_oid'],
+                    row['expected_table_name'],
+                    row['dependent_table_oid'],
+                    row['dependent_table_name']))
+        log_output = '\n'.join(log_output)
+        log_output = log_output + '\n'
+        logger.error(log_output)
+
+        # log fix instructions for the orphaned toast tables to stdout and log file
+        gplog.log_literal(logger, logging.CRITICAL, checker.get_fix_text())
+
+        # log per-orphan table issue and cause to stdout and log file
+        for issue, segments in checker.iterate_issues():
+            cat_issue_obj = CatOrphanToastTableIssue(issue.table.oid,
+                                                     issue.table.catname,
+                                                     issue,
+                                                     segments)
+            error_object = getGPObject(issue.table.oid, issue.table.catname)
+            error_object.addOrphanToastTableIssue(cat_issue_obj)
+
+        do_repair_for_segments(segments_to_repair_statements=checker.add_repair_statements(GV.cfg),
+                               issue_type="orphaned_toast_tables",
+                               description='Repairing orphaned TOAST tables')
 
 
 ############################################################################
@@ -3029,6 +3087,14 @@ all_checks = {
             "order": 13,
             "online": True
         },
+    "orphaned_toast_tables":
+        {
+            "description": "Check pg_class and pg_depend for orphaned TOAST tables",
+            "fn": checkOrphanedToastTables,
+            "version": 'main',
+            "order": 14,
+            "online": True
+        },
 }
 
 
@@ -3139,6 +3205,7 @@ def runAllChecks():
 
 
 def do_repair(sql_repair_contents, issue_type, description):
+    logger.info("Starting repair of %s with %d issues" % (description, len(sql_repair_contents)))
     if len(sql_repair_contents) == 0:
         return
 
@@ -3146,6 +3213,18 @@ def do_repair(sql_repair_contents, issue_type, description):
     try:
         repair_obj = Repair(context=GV, issue_type=issue_type, desc=description)
         repair_dir_path = repair_obj.create_repair(sql_repair_contents=sql_repair_contents)
+    except Exception, ex:
+        logger.fatal(str(ex))
+
+    print_repair_issues(repair_dir_path)
+
+def do_repair_for_segments(segments_to_repair_statements, issue_type, description):
+    logger.info("Starting repair of %s" % description)
+
+    repair_dir_path = ""
+    try:
+        repair_obj = Repair(context=GV, issue_type=issue_type, desc=description)
+        repair_dir_path = repair_obj.create_segment_repair_scripts(segments_to_repair_statements)
     except Exception, ex:
         logger.fatal(str(ex))
 
@@ -3160,7 +3239,8 @@ def do_repair_for_extra(catalog_issues):
             repair_obj = Repair(context=GV, issue_type="extra", desc="Removing extra entries")
             repair_dir_path = repair_obj.create_repair_for_extra_missing(catalog_table_obj=catalog_table_obj,
                                                                          issues=issues,
-                                                                         pk_name=pk_name)
+                                                                         pk_name=pk_name,
+                                                                         segments=GV.cfg)
         except Exception, ex:
             logger.fatal(str(ex))
 
@@ -3176,7 +3256,7 @@ def print_repair_issues(repair_dir_path):
 def checkReindexRepair():
     if len(GV.Reindex) > 0:
         # dbname.type.timestamp.sql
-        filename = '%s.%s.%s.sql' % (GV.dbname, "reindex", Repair.TIMESTAMP)
+        filename = '%s.%s.%s.sql' % (GV.dbname, "reindex", GV.timestamp)
         fullpath = '%s/%s' % (GV.opt['-g'], filename)
         try:
             file = open(fullpath, 'w')
@@ -3208,7 +3288,7 @@ def checkPoliciesRepair():
 def checkSegmentRepair(maybeRemove, catmod_guc, seg):
     # dbid.host.port.dbname.timestamp.sql
     c = GV.cfg[seg]
-    filename = '%i.%s.%i.%s.%s.sql' % (seg, c['hostname'], c['port'], GV.dbname, Repair.TIMESTAMP)
+    filename = '%i.%s.%i.%s.%s.sql' % (seg, c['hostname'], c['port'], GV.dbname, GV.timestamp)
     filename = filename.replace(' ', '_')
     fullpath = '%s/%s' % (GV.opt['-g'], filename)
     try:
@@ -3801,6 +3881,18 @@ class CatDependencyIssue:
         )
 
 # -------------------------------------------------------------------------------
+class CatOrphanToastTableIssue:
+    def __init__(self, oid, catname, issue, segments):
+        self.oid = oid
+        self.catname = catname
+        self.issue = issue
+        self.segments = segments
+
+    def report(self):
+        myprint('%s' % self.issue.description)
+        myprint('''On segment(s) %s table '%s' (oid: %s) %s''' % (', '.join(map(str, sorted(self.segments))), self.catname, self.oid, self.issue.cause))
+
+# -------------------------------------------------------------------------------
 class GPObject:
     def __init__(self, oid, catname):
         self.oid = oid
@@ -3811,6 +3903,7 @@ class GPObject:
         self.aclIssues = {}  # key=issue.catname, value=list of catACLIssue
         self.foreignkeyIssues = {}  # key=issue.catname, value=list of catForeignKeyIssue
         self.dependencyIssues = {} # key=issue.catname, value=list of catDependencyIssue
+        self.orphanToastTableIssues = {} # key=issue.catname, value=list of orphanToastTableIssues
 
     def addDependencyIssue(self, issue):
         if issue.catname in self.dependencyIssues:
@@ -3847,6 +3940,12 @@ class GPObject:
             self.foreignkeyIssues[issue.catname].append(issue)
         else:
             self.foreignkeyIssues[issue.catname] = [issue]
+
+    def addOrphanToastTableIssue(self, issue):
+        if issue.catname in self.orphanToastTableIssues:
+            self.orphanToastTableIssues[issue.catname].append(issue)
+        else:
+            self.orphanToastTableIssues[issue.catname] = [issue]
 
     def isTopLevel(self):
         return True
@@ -3940,6 +4039,13 @@ class GPObject:
                     each.report()
             myprint('')
 
+        # Report Orphan Toast Table issues
+        if len(self.orphanToastTableIssues):
+            for catname, issues in self.orphanToastTableIssues.iteritems():
+                for each in issues:
+                    each.report()
+            myprint('')
+
         myprint = _myprint
 
         # Collect all tables with missing issues for later reporting
@@ -3987,7 +4093,7 @@ class RelationObject(GPObject):
         self.paroid = None
 
     def reportAllIssues(self):
-        oid = 'N/A' if self.oid is None else self.oid
+        oid = 'N/A' if self.oid is None else str(self.oid)
         nspname = 'N/A' if self.nspname is None else self.nspname
         relname = 'N/A' if self.relname is None else self.relname
 
@@ -3996,14 +4102,14 @@ class RelationObject(GPObject):
             myprint('----------------------------------------------------')
 
             objname = 'Type' if self.relkind == 'c' else 'Relation'
-            myprint('%s oid: %d' % (objname, oid))
+            myprint('%s oid: %s' % (objname, oid))
             myprint('%s schema: %s' % (objname, nspname))
             myprint('%s name: %s' % (objname, relname))
 
         else:
             myprint('    Sub-object: ')
             myprint('    ----------------------------------------------------')
-            myprint('    Relation oid: %d' % oid)
+            myprint('    Relation oid: %s' % oid)
             myprint('    Relation schema: %s' % nspname)
             myprint('    Relation name: %s' % relname)
         myprint('')
@@ -4165,7 +4271,7 @@ def checkcatReport():
             reportAllIssuesRecursive(child, graph)
 
     buildGraph()
-    reportedCheck = ['duplicate','missing_extraneous','inconsistent','foreign_key','acl']
+    reportedCheck = ['duplicate','missing_extraneous','inconsistent','foreign_key','acl', 'orphaned_toast_tables']
     myprint('')
     myprint('SUMMARY REPORT')
     myprint('===================================================================')
@@ -4185,7 +4291,7 @@ def checkcatReport():
         if total == 0:
             myprint('Found no catalog issue\n')
             if par.catname in ['pg_constraint']:
-                myprint('Warnings were generated, see %s for detail\n' % get_logfile())
+                myprint('Warnings were generated, see %s for detail\n' % gplog.get_logfile())
         else:
             myprint('Found a total of %d issue(s)' % total)
 
@@ -4245,11 +4351,11 @@ def checkcatReport():
     notReported = set(GV.failedChecks).difference(reportedCheck)
     if len(notReported) > 0:
         myprint('Failed test(s) that are not reported here: %s' % (', '.join(notReported)))
-        myprint('See %s for detail\n' % get_logfile())
+        myprint('See %s for detail\n' % gplog.get_logfile())
 
 
 def _myprint(str, level=logging.CRITICAL):
-    log_literal(logger, level, str)
+    gplog.log_literal(logger, level, str)
 
 
 myprint = _myprint
@@ -4265,7 +4371,7 @@ def generateVerifyFile(catname, fields, results, checkname):
           ) alltyprelids
           GROUP BY relname, oid ORDER BY count(*) desc
     '''.format(in_clause=in_clause)
-    filename = 'gpcheckcat.verify.%s.%s.%s.%s.sql' % (GV.dbname, catname, checkname, Repair.TIMESTAMP)
+    filename = 'gpcheckcat.verify.%s.%s.%s.%s.sql' % (GV.dbname, catname, checkname, GV.timestamp)
     try:
         with open(filename, 'w') as fp:
             fp.write(verify_sql + '\n')
@@ -4277,6 +4383,13 @@ def truncate_batch_size(primaries):
         GV.opt['-B'] = primaries
         myprint("Truncated batch size to number of primaries: %d" % primaries)
 
+def check_gpexpand():
+    check_result, msg = conflict_with_gpexpand("gpcheckcat",
+                                               refuse_phase1=True,
+                                               refuse_phase2=False)
+    if not check_result:
+        myprint(msg)
+        sys.exit(1)
 
 def main():
     parseCommandLine()
@@ -4288,6 +4401,9 @@ def main():
     if GV.version < "4.0":
         myprint("Error: only Greenplum database version >= 4.0 are supported\n")
         sys.exit(GV.retcode)
+
+    # gpcheckcat should check gpexpand runnning status
+    check_gpexpand()
 
     GV.cfg = getGPConfiguration()
     truncate_batch_size(len(GV.cfg.keys()))

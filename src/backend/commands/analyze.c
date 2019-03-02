@@ -130,7 +130,7 @@
 #include "funcapi.h"
 #include "libpq-fe.h"
 #include "utils/builtins.h"
-#include "utils/hyperloglog/hyperloglog.h"
+#include "utils/hyperloglog/gp_hyperloglog.h"
 #include "utils/snapmgr.h"
 
 
@@ -139,7 +139,7 @@
  * distinct values estimated by hyperloglog is within an error of 0.3%,
  * we consider everything as distinct.
  */
-#define HLL_ERROR_MARGIN  0.003
+#define GP_HLL_ERROR_MARGIN  0.003
 
 /* Data structure for Algorithm S from Knuth 3.4.2 */
 typedef struct
@@ -184,7 +184,7 @@ static void compute_index_stats(Relation onerel, double totalrows,
 					HeapTuple *rows, int numrows,
 					MemoryContext col_context);
 static VacAttrStats *examine_attribute(Relation onerel, int attnum,
-				  Node *index_expr);
+				  Node *index_expr, int elevel);
 static int acquire_sample_rows_dispatcher(Relation onerel, bool inh, int elevel,
 										  HeapTuple *rows, int targrows,
 										  double *totalrows, double *totaldeadrows);
@@ -547,7 +547,7 @@ do_analyze_rel(Relation onerel, VacuumStmt *vacstmt,
 								col, RelationGetRelationName(onerel))));
 			unique_cols = bms_add_member(unique_cols, i);
 
-			vacattrstats[tcnt] = examine_attribute(onerel, i, NULL);
+			vacattrstats[tcnt] = examine_attribute(onerel, i, NULL, elevel);
 			if (vacattrstats[tcnt] != NULL)
 				tcnt++;
 		}
@@ -561,7 +561,7 @@ do_analyze_rel(Relation onerel, VacuumStmt *vacstmt,
 		tcnt = 0;
 		for (i = 1; i <= attr_cnt; i++)
 		{
-			vacattrstats[tcnt] = examine_attribute(onerel, i, NULL);
+			vacattrstats[tcnt] = examine_attribute(onerel, i, NULL, elevel);
 			if (vacattrstats[tcnt] != NULL)
 				tcnt++;
 		}
@@ -615,7 +615,7 @@ do_analyze_rel(Relation onerel, VacuumStmt *vacstmt,
 						indexkey = (Node *) lfirst(indexpr_item);
 						indexpr_item = lnext(indexpr_item);
 						thisdata->vacattrstats[tcnt] =
-							examine_attribute(Irel[ind], i + 1, indexkey);
+							examine_attribute(Irel[ind], i + 1, indexkey, elevel);
 						if (thisdata->vacattrstats[tcnt] != NULL)
 							tcnt++;
 					}
@@ -659,7 +659,7 @@ do_analyze_rel(Relation onerel, VacuumStmt *vacstmt,
 		{
 			acquire_hll_by_query(onerel, attr_cnt, vacattrstats, elevel);
 
-			elog (LOG,"HLL FULL SCAN ");
+			ereport(elevel, (errmsg("HLL FULL SCAN")));
 		}
 	}
 
@@ -793,10 +793,10 @@ do_analyze_rel(Relation onerel, VacuumStmt *vacstmt,
 					}
 					else if(stats->stahll != NULL)
 					{
-						((HLLCounter) (stats->stahll))->relPages = relpages;
-						((HLLCounter) (stats->stahll))->relTuples = totalrows;
+						((GpHLLCounter) (stats->stahll))->relPages = relpages;
+						((GpHLLCounter) (stats->stahll))->relTuples = totalrows;
 
-						hll_length = hyperloglog_len((HLLCounter)stats->stahll);
+						hll_length = gp_hyperloglog_len((GpHLLCounter)stats->stahll);
 						hll_values[0] = datumCopy(PointerGetDatum(stats->stahll), false, hll_length);
 						stakind = STATISTIC_KIND_HLL;
 					}
@@ -1191,7 +1191,7 @@ compute_index_stats(Relation onerel, double totalrows,
  * and index_expr is the expression tree representing the column's data.
  */
 static VacAttrStats *
-examine_attribute(Relation onerel, int attnum, Node *index_expr)
+examine_attribute(Relation onerel, int attnum, Node *index_expr, int elevel)
 {
 	Form_pg_attribute attr = onerel->rd_att->attrs[attnum - 1];
 	HeapTuple	typtuple;
@@ -1212,6 +1212,7 @@ examine_attribute(Relation onerel, int attnum, Node *index_expr)
 	 * fixed fields of the pg_attribute tuple.
 	 */
 	stats = (VacAttrStats *) palloc0(sizeof(VacAttrStats));
+	stats->elevel = elevel;
 	stats->attr = (Form_pg_attribute) palloc(ATTRIBUTE_FIXED_PART_SIZE);
 	memcpy(stats->attr, attr, ATTRIBUTE_FIXED_PART_SIZE);
 
@@ -2137,7 +2138,7 @@ acquire_inherited_sample_rows(Relation onerel, int elevel,
 
 /*
  * This function acquires the HLL counter for the entire table by
- * using the hyperloglog extension hyperloglog_accum().
+ * using the hyperloglog extension gp_hyperloglog_accum().
  *
  * Unlike acquire_sample_rows(), this returns the HLL counter for
  * the entire table, and not jsut a sample, and it stores the HLL
@@ -2160,7 +2161,7 @@ acquire_hll_by_query(Relation onerel, int nattrs, VacAttrStats **attrstats, int 
 	for (i = 0; i < nattrs; i++)
 	{
 		const char *attname = quote_identifier(NameStr(attrstats[i]->attr->attname));
-		appendStringInfo(&columnStr, "pg_catalog.hyperloglog_accum(%s)", attname);
+		appendStringInfo(&columnStr, "pg_catalog.gp_hyperloglog_accum(%s)", attname);
 		if(i != nattrs-1)
 			appendStringInfo(&columnStr, ", ");
 	}
@@ -2213,7 +2214,7 @@ acquire_hll_by_query(Relation onerel, int nattrs, VacAttrStats **attrstats, int 
 											   &isNull);
 			if (isNull)
 			{
-				attrstats[j]->stahll_full = (bytea *)hyperloglog_init_def();
+				attrstats[j]->stahll_full = (bytea *)gp_hyperloglog_init_def();
 				continue;
 			}
 
@@ -2860,7 +2861,7 @@ std_typanalyze(VacAttrStats *stats)
 	 */
 	List *va_cols = list_make1_int(stats->attr->attnum);
 	if (rel_part_status(attr->attrelid) == PART_STATUS_ROOT &&
-		leaf_parts_analyzed(stats->attr->attrelid, InvalidOid, va_cols) &&
+		leaf_parts_analyzed(stats->attr->attrelid, InvalidOid, va_cols, stats->elevel) &&
 		op_hashjoinable(eqopr, stats->attrtypid))
 	{
 		stats->merge_stats = true;
@@ -2963,9 +2964,11 @@ compute_minimal_stats(VacAttrStatsP stats,
 
 	fmgr_info(mystats->eqfunc, &f_cmpeq);
 
-	stats->stahll = (bytea *)hyperloglog_init_def();
+	stats->stahll = (bytea *)gp_hyperloglog_init_def();
 
-	elog(LOG, "Computing Minimal Stats : column %s", get_attname(stats->attr->attrelid, stats->attr->attnum));
+	ereport(DEBUG2,
+			(errmsg("Computing Minimal Stats for column %s",
+					get_attname(stats->attr->attrelid, stats->attr->attnum))));
 
 	for (i = 0; i < samplerows; i++)
 	{
@@ -2987,7 +2990,7 @@ compute_minimal_stats(VacAttrStatsP stats,
 		}
 		nonnull_cnt++;
 
-		stats->stahll = (bytea *)hyperloglog_add_item((HLLCounter) stats->stahll, value, stats->attr->attlen, stats->attr->attbyval, stats->attr->attalign);
+		stats->stahll = (bytea *)gp_hyperloglog_add_item((GpHLLCounter) stats->stahll, value, stats->attr->attlen, stats->attr->attbyval, stats->attr->attalign);
 
 		/*
 		 * If it's a variable-width field, add up widths for average width
@@ -3091,9 +3094,9 @@ compute_minimal_stats(VacAttrStatsP stats,
 			summultiple += track[nmultiple].count;
 		}
 
-		((HLLCounter) (stats->stahll))->nmultiples = nmultiple;
-		((HLLCounter) (stats->stahll))->ndistinct = track_cnt;
-		((HLLCounter) (stats->stahll))->samplerows = samplerows;
+		((GpHLLCounter) (stats->stahll))->nmultiples = nmultiple;
+		((GpHLLCounter) (stats->stahll))->ndistinct = track_cnt;
+		((GpHLLCounter) (stats->stahll))->samplerows = samplerows;
 
 		if (nmultiple == 0)
 		{
@@ -3277,7 +3280,9 @@ compute_very_minimal_stats(VacAttrStatsP stats,
 	bool		is_varwidth = (!stats->attr->attbyval &&
 							   stats->attr->attlen < 0);
 
-	elog(LOG, "Computing Very Minimal Stats : column %s", get_attname(stats->attr->attrelid, stats->attr->attnum));
+	ereport(DEBUG2,
+			(errmsg("Computing Very Minimal Stats for column %s",
+					get_attname(stats->attr->attrelid, stats->attr->attnum))));
 
 	for (i = 0; i < samplerows; i++)
 	{
@@ -3393,10 +3398,12 @@ compute_scalar_stats(VacAttrStatsP stats,
 
 	PrepareSortSupportFromOrderingOp(mystats->ltopr, &ssup);
 
-	// Initialize HLL counter to be stored in stats
-	stats->stahll = (bytea *)hyperloglog_init_def();
+	/* Initialize HLL counter to be stored in stats */
+	stats->stahll = (bytea *)gp_hyperloglog_init_def();
 
-	elog(LOG, "Computing Scalar Stats : column %s", get_attname(stats->attr->attrelid, stats->attr->attnum));
+	ereport(DEBUG2,
+			(errmsg("Computing Scalar Stats for column %s",
+					get_attname(stats->attr->attrelid, stats->attr->attnum))));
 
 	/* Initial scan to find sortable values */
 	for (i = 0; i < samplerows; i++)
@@ -3416,7 +3423,7 @@ compute_scalar_stats(VacAttrStatsP stats,
 		}
 		nonnull_cnt++;
 
-		stats->stahll = (bytea *)hyperloglog_add_item((HLLCounter) stats->stahll, value, stats->attr->attlen, stats->attr->attbyval, stats->attr->attalign);
+		stats->stahll = (bytea *)gp_hyperloglog_add_item((GpHLLCounter) stats->stahll, value, stats->attr->attlen, stats->attr->attbyval, stats->attr->attalign);
 
 		/*
 		 * If it's a variable-width field, add up widths for average width
@@ -3546,9 +3553,9 @@ compute_scalar_stats(VacAttrStatsP stats,
 		// interpolate NDV calculation based on the hll distinct count
 		// for each column in leaf partitions which will be used later
 		// to merge root stats
-		((HLLCounter) (stats->stahll))->nmultiples = nmultiple;
-		((HLLCounter) (stats->stahll))->ndistinct = ndistinct;
-		((HLLCounter) (stats->stahll))->samplerows = samplerows;
+		((GpHLLCounter) (stats->stahll))->nmultiples = nmultiple;
+		((GpHLLCounter) (stats->stahll))->ndistinct = ndistinct;
+		((GpHLLCounter) (stats->stahll))->samplerows = samplerows;
 
 		if (nmultiple == 0)
 		{
@@ -3603,14 +3610,14 @@ compute_scalar_stats(VacAttrStatsP stats,
 		}
 
 		/*
-		 * For FULLSCAN HLL, get ndistinct from the HLLCounter
+		 * For FULLSCAN HLL, get ndistinct from the GpHLLCounter
 		 * instead of computing it
 		 */
 		if (stats->stahll_full != NULL)
 		{
-			HLLCounter hLLFull = (HLLCounter) DatumGetByteaP(stats->stahll_full);
-			HLLCounter hllFull_copy = hll_copy(hLLFull);
-			stats->stadistinct = round(hyperloglog_estimate(hllFull_copy));
+			GpHLLCounter hLLFull = (GpHLLCounter) DatumGetByteaP(stats->stahll_full);
+			GpHLLCounter hllFull_copy = gp_hll_copy(hLLFull);
+			stats->stadistinct = round(gp_hyperloglog_estimate(hllFull_copy));
 			pfree(hllFull_copy);
 			if ((fabs(totalrows - stats->stadistinct) / (float) totalrows) < 0.05)
 			{
@@ -3938,7 +3945,10 @@ merge_leaf_stats(VacAttrStatsP stats,
 		get_parts(stats->attr->attrelid, 0 /*level*/, 0 /*parent*/,
 				  false /* inctemplate */, true /*includesubparts*/);
 	Assert(pn);
-	elog(LOG, "Merging leaf partition stats to calculate root partition stats : column %s", get_attname(stats->attr->attrelid, stats->attr->attnum));
+	ereport(DEBUG2,
+			(errmsg("Merging leaf partition stats to calculate root partition stats : column %s",
+					get_attname(stats->attr->attrelid, stats->attr->attnum))));
+
 	List *oid_list = all_leaf_partition_relids(pn); /* all leaves */
 	StdAnalyzeData *mystats = (StdAnalyzeData *) stats->extra_data;
 	int numPartitions = list_length(oid_list);
@@ -3976,12 +3986,12 @@ merge_leaf_stats(VacAttrStatsP stats,
 	// NDV calculations
 	float4 colAvgWidth = 0;
 	float4 nullCount = 0;
-	HLLCounter *hllcounters = (HLLCounter *) palloc0(numPartitions * sizeof(HLLCounter));
-	HLLCounter *hllcounters_fullscan = (HLLCounter *) palloc0(numPartitions * sizeof(HLLCounter));
-	HLLCounter *hllcounters_copy = (HLLCounter *) palloc0(numPartitions * sizeof(HLLCounter));
+	GpHLLCounter *hllcounters = (GpHLLCounter *) palloc0(numPartitions * sizeof(GpHLLCounter));
+	GpHLLCounter *hllcounters_fullscan = (GpHLLCounter *) palloc0(numPartitions * sizeof(GpHLLCounter));
+	GpHLLCounter *hllcounters_copy = (GpHLLCounter *) palloc0(numPartitions * sizeof(GpHLLCounter));
 
-	HLLCounter finalHLL = NULL;
-	HLLCounter finalHLLFull = NULL;
+	GpHLLCounter finalHLL = NULL;
+	GpHLLCounter finalHLLFull = NULL;
 	int i = 0;
 	double ndistinct = 0.0;
 	int fullhll_count = 0;
@@ -4015,9 +4025,9 @@ merge_leaf_stats(VacAttrStatsP stats,
 
 		if (hllSlot.nvalues > 0)
 		{
-			hllcounters_fullscan[i] = (HLLCounter) DatumGetByteaP(hllSlot.values[0]);
-			HLLCounter finalHLLFull_intermediate = finalHLLFull;
-			finalHLLFull = hyperloglog_merge_counters(finalHLLFull_intermediate, hllcounters_fullscan[i]);
+			hllcounters_fullscan[i] = (GpHLLCounter) DatumGetByteaP(hllSlot.values[0]);
+			GpHLLCounter finalHLLFull_intermediate = finalHLLFull;
+			finalHLLFull = gp_hyperloglog_merge_counters(finalHLLFull_intermediate, hllcounters_fullscan[i]);
 			if (NULL != finalHLLFull_intermediate)
 			{
 				pfree(finalHLLFull_intermediate);
@@ -4032,13 +4042,13 @@ merge_leaf_stats(VacAttrStatsP stats,
 
 		if (hllSlot.nvalues > 0)
 		{
-			hllcounters[i] = (HLLCounter) DatumGetByteaP(hllSlot.values[0]);
+			hllcounters[i] = (GpHLLCounter) DatumGetByteaP(hllSlot.values[0]);
 			nDistincts[i] = (float) hllcounters[i]->ndistinct;
 			nMultiples[i] = (float) hllcounters[i]->nmultiples;
 			sampleCount += hllcounters[i]->samplerows;
-			hllcounters_copy[i] = hll_copy(hllcounters[i]);
-			HLLCounter finalHLL_intermediate = finalHLL;
-			finalHLL = hyperloglog_merge_counters(finalHLL_intermediate, hllcounters[i]);
+			hllcounters_copy[i] = gp_hll_copy(hllcounters[i]);
+			GpHLLCounter finalHLL_intermediate = finalHLL;
+			finalHLL = gp_hyperloglog_merge_counters(finalHLL_intermediate, hllcounters[i]);
 			if (NULL != finalHLL_intermediate)
 			{
 				pfree(finalHLL_intermediate);
@@ -4067,7 +4077,7 @@ merge_leaf_stats(VacAttrStatsP stats,
 		 */
 		if (fullhll_count == totalhll_count)
 		{
-			ndistinct = hyperloglog_estimate(finalHLLFull);
+			ndistinct = gp_hyperloglog_estimate(finalHLLFull);
 			pfree(finalHLLFull);
 			/*
 			 * For fullscan the ndistinct is calculated based on the entire table scan
@@ -4075,7 +4085,7 @@ merge_leaf_stats(VacAttrStatsP stats,
 			 * else the ndistinct value will provide the actual value and we do not ,
 			 * need to do any additional calculation for the nmultiple
 			 */
-			if ((fabs(totalTuples - ndistinct) / (float) totalTuples) < HLL_ERROR_MARGIN)
+			if ((fabs(totalTuples - ndistinct) / (float) totalTuples) < GP_HLL_ERROR_MARGIN)
 			{
 				allDistinct = true;
 			}
@@ -4088,7 +4098,7 @@ merge_leaf_stats(VacAttrStatsP stats,
 		 */
 		else if (finalHLL != NULL && samplehll_count == totalhll_count)
 		{
-			ndistinct = hyperloglog_estimate(finalHLL);
+			ndistinct = gp_hyperloglog_estimate(finalHLL);
 			pfree(finalHLL);
 			/*
 			 * For sampled HLL counter, the ndistinct calculated is based on the
@@ -4097,14 +4107,14 @@ merge_leaf_stats(VacAttrStatsP stats,
 			 * the number of distinct values for the table based on the estimator
 			 * proposed by Haas and Stokes, used later in the code.
 			 */
-			if ((fabs(sampleCount - ndistinct) / (float) sampleCount) < HLL_ERROR_MARGIN)
+			if ((fabs(sampleCount - ndistinct) / (float) sampleCount) < GP_HLL_ERROR_MARGIN)
 			{
 				allDistinct = true;
 			}
 			else
 			{
 				/*
-				 * The hyperloglog_estimate() utility merges the number of
+				 * The gp_hyperloglog_estimate() utility merges the number of
 				 * distnct values accurately, but for the NDV estimator used later
 				 * in the code, we also need additional information for nmultiples,
 				 * i.e., the number of values that appeared more than once.
@@ -4116,10 +4126,10 @@ merge_leaf_stats(VacAttrStatsP stats,
 				 * P1 -> ndistinct1 , nmultiple1
 				 * P2 -> ndistinct2 , nmultiple2
 				 * P3 -> ndistinct3 , nmultiple3
-				 * Root -> ndistinct(Root) (using hyperloglog_estimate)
-				 * nunique1 = ndistinct(Root) - hyperloglog_estimate(P2 & P3)
-				 * nunique2 = ndistinct(Root) - hyperloglog_estimate(P1 & P3)
-				 * nunique3 = ndistinct(Root) - hyperloglog_estimate(P2 & P1)
+				 * Root -> ndistinct(Root) (using gp_hyperloglog_estimate)
+				 * nunique1 = ndistinct(Root) - gp_hyperloglog_estimate(P2 & P3)
+				 * nunique2 = ndistinct(Root) - gp_hyperloglog_estimate(P1 & P3)
+				 * nunique3 = ndistinct(Root) - gp_hyperloglog_estimate(P2 & P1)
 				 * And finally once we have unique values in individual partitions,
 				 * we can get the nmultiples on the ROOT as seen below,
 				 * nmultiple(Root) = ndistinct(Root) - (sum of uniques in each partition)
@@ -4129,17 +4139,17 @@ merge_leaf_stats(VacAttrStatsP stats,
 				 * hll counters towards the left of index i and excluding the hll
 				 * counter at index i
 				 */
-				HLLCounter *hllcounters_left = (HLLCounter *) palloc0(numPartitions * sizeof(HLLCounter));
+				GpHLLCounter *hllcounters_left = (GpHLLCounter *) palloc0(numPartitions * sizeof(GpHLLCounter));
 
 				/*
 				 * hllcounters_right array stores the merged hll result of all the
 				 * hll counters towards the right of index i and excluding the hll
 				 * counter at index i
 				 */
-				HLLCounter *hllcounters_right = (HLLCounter *) palloc0(numPartitions * sizeof(HLLCounter));
+				GpHLLCounter *hllcounters_right = (GpHLLCounter *) palloc0(numPartitions * sizeof(GpHLLCounter));
 
-				hllcounters_left[0] = hyperloglog_init_def();
-				hllcounters_right[numPartitions - 1] = hyperloglog_init_def();
+				hllcounters_left[0] = gp_hyperloglog_init_def();
+				hllcounters_right[numPartitions - 1] = gp_hyperloglog_init_def();
 
 				/*
 				 * The following loop populates the left and right array by accumulating the merged
@@ -4163,13 +4173,13 @@ merge_leaf_stats(VacAttrStatsP stats,
 					/* populate left array */
 					if (nDistincts[i - 1] == 0)
 					{
-						hllcounters_left[i] = hll_copy(hllcounters_left[i - 1]);
+						hllcounters_left[i] = gp_hll_copy(hllcounters_left[i - 1]);
 					}
 					else
 					{
-						HLLCounter hllcounter_temp1 = hll_copy(hllcounters_copy[i - 1]);
-						HLLCounter hllcounter_temp2 = hll_copy(hllcounters_left[i - 1]);
-						hllcounters_left[i] = hyperloglog_merge_counters(hllcounter_temp1, hllcounter_temp2);
+						GpHLLCounter hllcounter_temp1 = gp_hll_copy(hllcounters_copy[i - 1]);
+						GpHLLCounter hllcounter_temp2 = gp_hll_copy(hllcounters_left[i - 1]);
+						hllcounters_left[i] = gp_hyperloglog_merge_counters(hllcounter_temp1, hllcounter_temp2);
 						pfree(hllcounter_temp1);
 						pfree(hllcounter_temp2);
 					}
@@ -4177,13 +4187,13 @@ merge_leaf_stats(VacAttrStatsP stats,
 					/* populate right array */
 					if (nDistincts[numPartitions - i] == 0)
 					{
-						hllcounters_right[numPartitions - i - 1] = hll_copy(hllcounters_right[numPartitions - i]);
+						hllcounters_right[numPartitions - i - 1] = gp_hll_copy(hllcounters_right[numPartitions - i]);
 					}
 					else
 					{
-						HLLCounter hllcounter_temp1 = hll_copy(hllcounters_copy[numPartitions - i]);
-						HLLCounter hllcounter_temp2 = hll_copy(hllcounters_right[numPartitions - i]);
-						hllcounters_right[numPartitions - i - 1] = hyperloglog_merge_counters(hllcounter_temp1, hllcounter_temp2);
+						GpHLLCounter hllcounter_temp1 = gp_hll_copy(hllcounters_copy[numPartitions - i]);
+						GpHLLCounter hllcounter_temp2 = gp_hll_copy(hllcounters_right[numPartitions - i]);
+						hllcounters_right[numPartitions - i - 1] = gp_hyperloglog_merge_counters(hllcounter_temp1, hllcounter_temp2);
 						pfree(hllcounter_temp1);
 						pfree(hllcounter_temp2);
 					}
@@ -4196,17 +4206,17 @@ merge_leaf_stats(VacAttrStatsP stats,
 					if (nDistincts[i] == 0)
 						continue;
 
-					HLLCounter hllcounter_temp1 = hll_copy(hllcounters_left[i]);
-					HLLCounter hllcounter_temp2 = hll_copy(hllcounters_right[i]);
-					HLLCounter final = NULL;
-					final = hyperloglog_merge_counters(hllcounter_temp1, hllcounter_temp2);
+					GpHLLCounter hllcounter_temp1 = gp_hll_copy(hllcounters_left[i]);
+					GpHLLCounter hllcounter_temp2 = gp_hll_copy(hllcounters_right[i]);
+					GpHLLCounter final = NULL;
+					final = gp_hyperloglog_merge_counters(hllcounter_temp1, hllcounter_temp2);
 
 					pfree(hllcounter_temp1);
 					pfree(hllcounter_temp2);
 
 					if (final != NULL)
 					{
-						float nUniques = ndistinct - hyperloglog_estimate(final);
+						float nUniques = ndistinct - gp_hyperloglog_estimate(final);
 						nUnique += nUniques;
 						nmultiple += nMultiples[i] * (nUniques / nDistincts[i]);
 						pfree(final);

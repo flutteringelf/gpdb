@@ -24,8 +24,7 @@
 #include "executor/tuptable.h"
 #include "executor/instrument.h"            /* Instrumentation */
 #include "executor/execHHashagg.h"
-#include "executor/execWorkfile.h"
-#include "storage/bfz.h"
+#include "storage/buffile.h"
 #include "utils/datum.h"
 #include "utils/memutils.h"
 #include "utils/lsyscache.h"
@@ -48,12 +47,23 @@ struct BatchFileInfo
 {
 	int64 total_bytes;
 	int64 ntuples;
-	ExecWorkFile *wfile;
+	BufFile *wfile;
 };
 
+/*
+ * Estimate per-file memory overhead. We assume that a BufFile consumed about
+ * 64 bytes for various structs. It also keeps a buffer of size BLCKSZ. It
+ * can be temporarily freed with BufFileSuspend().
+ *
+ * FIXME: This code used to use a different kind of abstraction for reading
+ * files, called BFZ. That used a 16 kB buffer. To keep the calculations
+ * unmodified, we claim the buffer size to still be 16 kB. I got assertion
+ * failures in the regression tests when I tried changing this to BLCKSZ...
+ */
+/* #define FREEABLE_BATCHFILE_METADATA (BLCKSZ) */
+#define FREEABLE_BATCHFILE_METADATA (16 * 1024)
 #define BATCHFILE_METADATA \
-    (sizeof(BatchFileInfo) + sizeof(bfz_t) + sizeof(struct bfz_freeable_stuff))
-#define FREEABLE_BATCHFILE_METADATA (sizeof(struct bfz_freeable_stuff))
+	(sizeof(BatchFileInfo) + 64 + FREEABLE_BATCHFILE_METADATA)
 
 /* Used for padding */
 static char padding_dummy[MAXIMUM_ALIGNOF];
@@ -79,8 +89,24 @@ typedef enum InputRecordType
 		Assert((hashtable)->mem_for_metadata > 0); \
 		Assert((hashtable)->mem_for_metadata > (hashtable)->nbuckets * OVERHEAD_PER_BUCKET); \
 		if ((hashtable)->mem_for_metadata >= (hashtable)->max_mem) \
-			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR), \
-				errmsg(ERRMSG_GP_INSUFFICIENT_STATEMENT_MEMORY)));\
+		{ \
+			if (IsResGroupEnabled()) \
+			{ \
+				elog(HHA_MSG_LVL, \
+					 "HashAgg: no enough operator memory for spilling: " \
+					 "operator memory is %.0f bytes, " \
+					 "current meta data is %.0f bytes; " \
+					 "the overuse is allowed in resource group mode", \
+					 (hashtable)->max_mem, \
+					 (hashtable)->mem_for_metadata); \
+			} \
+			else \
+			{ \
+				ereport(ERROR, \
+						(errcode(ERRCODE_INTERNAL_ERROR), \
+						 errmsg(ERRMSG_GP_INSUFFICIENT_STATEMENT_MEMORY))); \
+			} \
+		} \
 	} while (0)
 
 #define GET_TOTAL_USED_SIZE(hashtable) \
@@ -286,7 +312,24 @@ makeHashAggEntryForInput(AggState *aggstate, TupleTableSlot *inputslot, uint32 h
 
 	if (GET_TOTAL_USED_SIZE(hashtable) + MAXALIGN(MAXALIGN(tup_len) + aggs_len) >=
 		hashtable->max_mem)
-		return NULL;
+	{
+		if (IsResGroupEnabled())
+		{
+			elog(HHA_MSG_LVL,
+				 "HashAgg: no enough operator memory to store new tuple: "
+				 "operator memory is %.0f bytes, "
+				 "current used size is %.0f bytes, "
+				 "need %lu bytes to store the new tuple; "
+				 "the overuse is allowed in resource group mode",
+				 hashtable->max_mem,
+				 GET_TOTAL_USED_SIZE(hashtable),
+				 MAXALIGN(MAXALIGN(tup_len) + aggs_len));
+		}
+		else
+		{
+			return NULL;
+		}
+	}
 
 	entry->tuple_and_aggs = mpool_alloc(hashtable->group_buf,
 										MAXALIGN(MAXALIGN(tup_len) + aggs_len));
@@ -329,7 +372,24 @@ makeHashAggEntryForGroup(AggState *aggstate, void *tuple_and_aggs,
 	MemoryContext oldcxt;
 
 	if (GET_TOTAL_USED_SIZE(hashtable) + input_size >= hashtable->max_mem)
-		return NULL;
+	{
+		if (IsResGroupEnabled())
+		{
+			elog(HHA_MSG_LVL,
+				 "HashAgg: no enough operator memory to store new group keys and aggregate values: "
+				 "operator memory is %.0f bytes, "
+				 "current used size is %.0f bytes, "
+				 "need %d bytes to store the new data; "
+				 "the overuse is allowed in resource group mode",
+				 hashtable->max_mem,
+				 GET_TOTAL_USED_SIZE(hashtable),
+				 input_size);
+		}
+		else
+		{
+			return NULL;
+		}
+	}
 
 	copy_tuple_and_aggs = mpool_alloc(hashtable->group_buf, input_size);
 	memcpy(copy_tuple_and_aggs, tuple_and_aggs, input_size);
@@ -698,14 +758,9 @@ calcHashAggTableSizes(double memquota,	/* Memory quota in bytes. */
 
 		if (IsResGroupEnabled() && out_hats->memquota > orig_memquota)
 		{
-			ereport(WARNING,
-					(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
-					 errmsg("No enough memory quota reserved for AggHash operator."),
-					 errdetail("The operator needs a minimal of %.0f bytes memory, "
-							   "but only %.0f bytes are reserved.  "
-							   "Temporarily increased the memory quota to execute the operator.",
-							   out_hats->memquota, orig_memquota),
-					 errhint("Consider increase memory_spill_ratio for better performance.")));
+			elog(HHA_MSG_LVL,
+				 "HashAgg: auto enlarge operator memory from %.0f to %.0f in resource group mode",
+				 out_hats->memquota, orig_memquota);
 		}
 	}
 	
@@ -1123,10 +1178,11 @@ getSpillFile(workfile_set *work_set, SpillSet *set, int file_no, int *p_alloc_si
 		spill_file->file_info->ntuples = 0;
 		/* Initialize to NULL in case the create function below throws an exception */
 		spill_file->file_info->wfile = NULL; 
-		spill_file->file_info->wfile = workfile_mgr_create_file(work_set);
+		spill_file->file_info->wfile = BufFileCreateTempInSet(work_set, false /* interXact */);
+		BufFilePledgeSequential(spill_file->file_info->wfile);	/* allow compression */
 
-		elog(HHA_MSG_LVL, "HashAgg: create %d level batch file %d with compression %d",
-			 set->level, file_no, work_set->metadata.bfz_compress_type);
+		elog(HHA_MSG_LVL, "HashAgg: create %d level batch file %d",
+			 set->level, file_no);
 
 		*p_alloc_size = BATCHFILE_METADATA;
 	}
@@ -1155,13 +1211,13 @@ suspendSpillFiles(SpillSet *spill_set)
 		if (spill_file->file_info &&
 			spill_file->file_info->wfile != NULL)
 		{
-			ExecWorkFile_Suspend(spill_file->file_info->wfile);
+			BufFileSuspend(spill_file->file_info->wfile);
 
 			freed_size += FREEABLE_BATCHFILE_METADATA;
 
 			elog(HHA_MSG_LVL, "HashAgg: %s contains " INT64_FORMAT " entries ("
 				 INT64_FORMAT " bytes)",
-				 spill_file->file_info->wfile->fileName,
+				 BufFileGetFilename(spill_file->file_info->wfile),
 				 spill_file->file_info->ntuples, spill_file->file_info->total_bytes);
 		}
 	}
@@ -1178,7 +1234,6 @@ closeSpillFile(AggState *aggstate, SpillSet *spill_set, int file_no)
 {
 	int freedspace = 0;
 	SpillFile *spill_file;
-	HashAggTable *hashtable = aggstate->hhashtable;
 	
 	Assert(spill_set != NULL && file_no < spill_set->num_spill_files);
 
@@ -1192,7 +1247,7 @@ closeSpillFile(AggState *aggstate, SpillSet *spill_set, int file_no)
 	if (spill_file->file_info &&
 		spill_file->file_info->wfile != NULL)
 	{
-		workfile_mgr_close_file(hashtable->work_set, spill_file->file_info->wfile);
+		BufFileClose(spill_file->file_info->wfile);
 		spill_file->file_info->wfile = NULL;
 		freedspace += (BATCHFILE_METADATA - sizeof(BatchFileInfo));
 		
@@ -1317,8 +1372,7 @@ spill_hash_table(AggState *aggstate)
 	/* Spill set does not have a workfile_set. Use existing or create new one as needed */
 	if (hashtable->work_set == NULL)
 	{
-		hashtable->work_set = workfile_mgr_create_set(BFZ, true /* can_be_reused */, &aggstate->ss.ps);
-		//aggstate->workfiles_created = true;
+		hashtable->work_set = workfile_mgr_create_set("HashAggregate", NULL);
 	}
 
 	/* Book keeping. */
@@ -1481,6 +1535,21 @@ expand_hash_table(AggState *aggstate)
 	Assert(nentries == hashtable->num_entries);
 }
 
+static void
+BufFileWriteOrError(BufFile *buffile, void *data, size_t size)
+{
+	size_t		ret;
+
+	ret = BufFileWrite(buffile, data, size);
+
+	if (ret != size && size != 0)
+	{
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write to temporary file: %m")));
+	}
+}
+
 /*
  * writeHashEntry -- write an hash entry to a batch file.
  *
@@ -1503,7 +1572,7 @@ writeHashEntry(AggState *aggstate, BatchFileInfo *file_info,
 	Assert(file_info != NULL);
 	Assert(file_info->wfile != NULL);
 
-	ExecWorkFile_Write(file_info->wfile, (void *)(&(entry->hashvalue)), sizeof(entry->hashvalue));
+	BufFileWriteOrError(file_info->wfile, (void *) &entry->hashvalue, sizeof(entry->hashvalue));
 
 	tuple_agg_size = memtuple_get_size((MemTuple)entry->tuple_and_aggs);
 	pergroup = (AggStatePerGroup) ((char *)entry->tuple_and_aggs + MAXALIGN(tuple_agg_size));
@@ -1526,12 +1595,12 @@ writeHashEntry(AggState *aggstate, BatchFileInfo *file_info,
 		}
 	}
 
-	ExecWorkFile_Write(file_info->wfile, (char *)&total_size, sizeof(total_size));
-	ExecWorkFile_Write(file_info->wfile, entry->tuple_and_aggs, tuple_agg_size);
+	BufFileWriteOrError(file_info->wfile, (char *) &total_size, sizeof(total_size));
+	BufFileWriteOrError(file_info->wfile, entry->tuple_and_aggs, tuple_agg_size);
 	Assert(MAXALIGN(tuple_agg_size) - tuple_agg_size <= MAXIMUM_ALIGNOF);
 	if (MAXALIGN(tuple_agg_size) - tuple_agg_size > 0)
 	{
-		ExecWorkFile_Write(file_info->wfile, padding_dummy, MAXALIGN(tuple_agg_size) - tuple_agg_size);
+		BufFileWriteOrError(file_info->wfile, padding_dummy, MAXALIGN(tuple_agg_size) - tuple_agg_size);
 	}
 
 	for (aggno = 0; aggno < aggstate->numaggs; aggno++)
@@ -1545,13 +1614,13 @@ writeHashEntry(AggState *aggstate, BatchFileInfo *file_info,
 			Size datum_size = datumGetSize(pergroupstate->transValue,
 										   peraggstate->transtypeByVal,
 										   peraggstate->transtypeLen);
-			ExecWorkFile_Write(file_info->wfile,
-						DatumGetPointer(pergroupstate->transValue), datum_size);
+			BufFileWriteOrError(file_info->wfile,
+								DatumGetPointer(pergroupstate->transValue), datum_size);
 			Assert(MAXALIGN(datum_size) - datum_size <= MAXIMUM_ALIGNOF);
 			if (MAXALIGN(datum_size) - datum_size > 0)
 			{
-				ExecWorkFile_Write(file_info->wfile,
-						padding_dummy, MAXALIGN(datum_size) - datum_size);
+				BufFileWriteOrError(file_info->wfile,
+									 padding_dummy, MAXALIGN(datum_size) - datum_size);
 			}
 		}
 	}
@@ -1667,27 +1736,28 @@ readHashEntry(AggState *aggstate, BatchFileInfo *file_info,
 
 	*p_input_size = 0;
 
-	if (ExecWorkFile_Read(file_info->wfile, (char *)p_hashkey, sizeof(HashKey)) != sizeof(HashKey))
+	if (BufFileRead(file_info->wfile, (char *) p_hashkey, sizeof(HashKey)) != sizeof(HashKey))
 	{
 		return NULL;
 	}
-	
-	if (ExecWorkFile_Read(file_info->wfile, (char *)p_input_size, sizeof(int32)) !=
-			sizeof(int32))
+
+	if (BufFileRead(file_info->wfile, (char *) p_input_size, sizeof(int32)) != sizeof(int32))
 	{
-		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-						errmsg("could not read from temporary file: %m")));
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not read from temporary file: %m")));
 	}
 
-	tuple_and_aggs = ExecWorkFile_ReadFromBuffer(file_info->wfile, *p_input_size);
+	tuple_and_aggs = BufFileReadFromBuffer(file_info->wfile, *p_input_size);
 	if (tuple_and_aggs == NULL)
 	{
 		oldcxt = MemoryContextSwitchTo(aggstate->tmpcontext->ecxt_per_tuple_memory);
 		tuple_and_aggs = palloc(*p_input_size);
-		int32 read_size = ExecWorkFile_Read(file_info->wfile, tuple_and_aggs, *p_input_size);
+		int32 read_size = BufFileRead(file_info->wfile, tuple_and_aggs, *p_input_size);
 		if (read_size != *p_input_size)
-			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-					errmsg("could not read from temporary file, requesting %d bytes, read %d bytes: %m",
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("could not read from temporary file, requesting %d bytes, read %d bytes: %m",
 							*p_input_size, read_size)));
 		MemoryContextSwitchTo(oldcxt);
 	}
@@ -1758,7 +1828,7 @@ agg_hash_reload(AggState *aggstate)
 
 	if (spill_file->file_info->wfile != NULL)
 	{
-		ExecWorkFile_Restart(spill_file->file_info->wfile);
+		BufFileResume(spill_file->file_info->wfile);
 		hashtable->mem_for_metadata  += FREEABLE_BATCHFILE_METADATA;
 	}
 
@@ -1881,7 +1951,7 @@ agg_hash_reload(AggState *aggstate)
         freed_size = suspendSpillFiles(hashtable->curr_spill_file->spill_set);
         hashtable->mem_for_metadata -= freed_size;
         elog(gp_workfile_caching_loglevel, "loaded hashtable from file %s and then respilled. we should delete file from work_set now",
-        		hashtable->curr_spill_file->file_info->wfile->fileName);
+			 BufFileGetFilename(hashtable->curr_spill_file->file_info->wfile));
         hashtable->curr_spill_file->respilled = true;
 	}
 
@@ -1959,8 +2029,26 @@ reCalcNumberBatches(HashAggTable *hashtable, SpillFile *spill_file)
 	
 	if (hashtable->mem_for_metadata +
 		nbatches * BATCHFILE_METADATA > hashtable->max_mem)
-		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-				 ERRMSG_GP_INSUFFICIENT_STATEMENT_MEMORY));
+	{
+		if (IsResGroupEnabled())
+		{
+			elog(HHA_MSG_LVL,
+				 "HashAgg: no enough operator memory for spilling: "
+				 "operator memory is %.0f bytes, "
+				 "current meta data is %.0f bytes, "
+				 "need %lu bytes for %u more batches; "
+				 "the overuse is allowed in resource group mode",
+				 hashtable->max_mem,
+				 hashtable->mem_for_metadata,
+				 nbatches * BATCHFILE_METADATA,
+				 nbatches);
+		}
+		else
+		{
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							ERRMSG_GP_INSUFFICIENT_STATEMENT_MEMORY));
+		}
+	}
 	
 	hashtable->hats.nbatches = nbatches;
 }

@@ -38,7 +38,7 @@ function configure() {
         CONFIGURE_FLAGS="${CONFIGURE_FLAGS} --without-zstd"
         ./configure --prefix=/usr/local/greenplum-db-devel --with-python --with-libxml --enable-orafce --disable-orca ${CONFIGURE_FLAGS}
       else
-        ./configure --prefix=/usr/local/greenplum-db-devel --with-perl --with-python --with-libxml --enable-mapreduce --enable-orafce --disable-orca ${CONFIGURE_FLAGS}
+        ./configure --prefix=/usr/local/greenplum-db-devel --with-perl --with-python --with-libxml --enable-mapreduce --enable-orafce --enable-tap-tests --disable-orca ${CONFIGURE_FLAGS}
       fi
   popd
 }
@@ -81,8 +81,7 @@ function make_cluster() {
     # no test case restarting the cluster
     su gpadmin -c "head -n 1 $MASTER_DATA_DIRECTORY/postmaster.pid > master.pid.bk"
     gen_gpexpand_input
-    su gpadmin -c "createdb gpstatus"
-    su gpadmin -c "gpexpand -i input -D gpstatus"
+    su gpadmin -c "gpexpand -i input"
   else
     su gpadmin -c "make create-demo-cluster"
   fi

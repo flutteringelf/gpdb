@@ -39,6 +39,7 @@
 #include "gpopt/translate/CTranslatorUtils.h"
 #include "gpopt/translate/CDXLTranslateContext.h"
 #include "gpopt/translate/CTranslatorRelcacheToDXL.h"
+#include "gpopt/translate/CTranslatorScalarToDXL.h"
 
 #include "naucrates/dxl/CDXLUtils.h"
 #include "naucrates/dxl/xml/dxltokens.h"
@@ -2741,20 +2742,6 @@ CTranslatorUtils::GetNumNonSystemColumns
 	}
 
 	return num_non_system_cols;
-}
-
-// Function to check if we should create stats bucket in DXL
-// Returns true if column datatype is not text/char/varchar/bpchar
-BOOL
-CTranslatorUtils::ShouldCreateStatsBucket
-	(
-	OID att_type_oid
-	)
-{
-	if (att_type_oid != TEXTOID && att_type_oid != CHAROID && att_type_oid != VARCHAROID && att_type_oid != BPCHAROID)
-		return true;
-
-	return false;
 }
 
 // EOF

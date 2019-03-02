@@ -60,7 +60,23 @@ JOBS_THAT_SHOULD_NOT_BLOCK_RELEASE = [
     'compile_gpdb_binary_swap_centos6',
     'icw_gporca_centos6_gpos_memory',
     'walrep_2',
-    'client_loader_remote_test_aix'
+    'client_loader_remote_test_aix',
+    'compile_gpdb_sles11',
+    'compile_gpdb_ubuntu16',
+    'compile_gpdb_aix7_remote', 
+    'icw_gporca_sles11', 
+    'icw_gporca_sles12', 
+    'icw_planner_sles12', 
+    'icw_planner_ubuntu16', 
+    'icw_gporca_conan_ubuntu16', 
+    'gpdb_packaging_ubuntu16', 
+    'resource_group_sles12', 
+    'madlib_build_gppkg', 
+    'MADlib_Test_planner_centos6', 
+    'MADlib_Test_orca_centos6', 
+    'MADlib_Test_planner_centos7', 
+    'MADlib_Test_orca_centos7',
+    'icw_extensions_gpcloud_ubuntu16'
 ] + RELEASE_VALIDATOR_JOB + JOBS_THAT_ARE_GATES
 
 def suggested_git_remote():
@@ -169,24 +185,29 @@ def how_to_use_generated_pipeline_message():
         msg += '    -p gpdb_master \\\n'
         msg += '    -c %s \\\n' % ARGS.output_filepath
         msg += '    -l ~/workspace/gp-continuous-integration/secrets/gpdb_common-ci-secrets.yml \\\n'
-        msg += '    -l ~/workspace/gp-continuous-integration/secrets/gpdb_master-ci-secrets.yml\n\n'
+        msg += '    -l ~/workspace/gp-continuous-integration/secrets/gpdb_master-ci-secrets.yml \\\n'
+        msg += '    -v pipeline-name=gpdb_master\n\n'
+
         msg += 'fly -t gpdb-prod \\\n'
         msg += '    set-pipeline \\\n'
         msg += '    -p gpdb_master_without_asserts \\\n'
         msg += '    -c %s \\\n' % ARGS.output_filepath
         msg += '    -l ~/workspace/gp-continuous-integration/secrets/gpdb_common-ci-secrets.yml \\\n'
-        msg += '    -l ~/workspace/gp-continuous-integration/secrets/gpdb_master_without_asserts-ci-secrets.yml\n' # pylint: disable=line-too-long
+        msg += '    -l ~/workspace/gp-continuous-integration/secrets/gpdb_master_without_asserts-ci-secrets.yml \\\n' # pylint: disable=line-too-long
+        msg += '    -v pipeline-name=gpdb_master_without_asserts\n'
     else:
+        pipeline_name = os.path.basename(ARGS.output_filepath).rsplit('.', 1)[0]
         msg += 'NOTE: You can set the developer pipeline with the following:\n\n'
         msg += 'fly -t gpdb-dev \\\n'
         msg += '    set-pipeline \\\n'
-        msg += '    -p %s \\\n' % os.path.basename(ARGS.output_filepath).rsplit('.', 1)[0]
+        msg += '    -p %s \\\n' % pipeline_name
         msg += '    -c %s \\\n' % ARGS.output_filepath
         msg += '    -l ~/workspace/gp-continuous-integration/secrets/gpdb_common-ci-secrets.yml \\\n'
         msg += '    -l ~/workspace/gp-continuous-integration/secrets/gpdb_master-ci-secrets.dev.yml \\\n'
         msg += '    -l ~/workspace/gp-continuous-integration/secrets/ccp_ci_secrets_gpdb-dev.yml \\\n'
         msg += '    -v gpdb-git-remote=%s \\\n' % suggested_git_remote()
-        msg += '    -v gpdb-git-branch=%s \n' % suggested_git_branch()
+        msg += '    -v gpdb-git-branch=%s \\\n' % suggested_git_branch()
+        msg += '    -v pipeline-name=%s \n' % pipeline_name
 
     return msg
 

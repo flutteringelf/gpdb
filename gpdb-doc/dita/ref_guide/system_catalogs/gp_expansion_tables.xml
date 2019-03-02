@@ -7,11 +7,11 @@
     <p>The <codeph>gpexpand.status_detail</codeph> table contains information about the status of
       tables involved in a system expansion operation. You can query this table to determine the
       status of tables being expanded, or to view the start and end time for completed tables. </p>
-    <p>This table also stores related information about the table such as the oid, disk size, and
-      normal distribution policy and key. Overall status information for the expansion is stored in
+    <p>This table also stores related information about the table such as the oid and disk size.
+      Overall status information for the expansion is stored in
         <xref href="gp_expansion_status.xml#topic1" type="topic" format="dita"/>.</p>
-    <p>In a normal expansion operation it is not necessary to modify the data stored in this table.
-      .</p>
+    <p>In a normal expansion operation it is not necessary to modify the data stored in this
+      table.</p>
     <table id="fb138428">
       <title>gpexpand.status_detail</title>
       <tgroup cols="4">
@@ -46,15 +46,6 @@
           </row>
           <row>
             <entry colname="col1">
-              <codeph>schema_oid</codeph>
-            </entry>
-            <entry colname="col2">oid</entry>
-            <entry colname="col3"/>
-            <entry colname="col4">OID for the schema of the database to which the table
-              belongs.</entry>
-          </row>
-          <row>
-            <entry colname="col1">
               <codeph>table_oid</codeph>
             </entry>
             <entry colname="col2">oid</entry>
@@ -63,35 +54,12 @@
           </row>
           <row>
             <entry colname="col1">
-              <codeph>distribution_policy</codeph>
-            </entry>
-            <entry colname="col2">smallint()</entry>
-            <entry colname="col3"/>
-            <entry colname="col4">Array of column IDs for the distribution key of the table.</entry>
-          </row>
-          <row>
-            <entry colname="col1">
-              <codeph>distribution_policy _names</codeph>
+              <codeph>root_partition_name</codeph>
             </entry>
             <entry colname="col2">text</entry>
             <entry colname="col3"/>
-            <entry colname="col4">Column names for the hash distribution key.</entry>
-          </row>
-          <row>
-            <entry colname="col1">
-              <codeph>distribution_policy _coloids</codeph>
-            </entry>
-            <entry colname="col2">text</entry>
-            <entry colname="col3"/>
-            <entry colname="col4">Column IDs for the distribution keys of the table.</entry>
-          </row>
-          <row>
-            <entry colname="col1">
-              <codeph>storage_options</codeph>
-            </entry>
-            <entry colname="col2">text</entry>
-            <entry colname="col3"/>
-            <entry colname="col4">Not enabled in this release. Do not update this field.</entry>
+            <entry colname="col4">For a partitioned table, the name of the root partition.
+              Otherwise, <codeph>None</codeph>.</entry>
           </row>
           <row>
             <entry colname="col1">

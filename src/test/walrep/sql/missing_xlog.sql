@@ -2,7 +2,7 @@
 create language plpythonu;
 -- end_ignore
 
-create or replace function pg_ctl(datadir text, command text, port int, contentid int)
+create or replace function pg_ctl(datadir text, command text, port int)
 returns text as $$
     import subprocess
 
@@ -10,7 +10,7 @@ returns text as $$
     if command in ('stop', 'restart'):
         cmd = cmd + '-w -m immediate %s' % command
     elif command == 'start':
-        opts = '-p %d -\-gp_dbid=0 -i -\-gp_contentid=%d' % (port, contentid)
+        opts = '-p %d -i ' % (port)
         cmd = cmd + '-o "%s" start' % opts
     elif command == 'reload':
         cmd = cmd + 'reload'
@@ -58,6 +58,7 @@ begin
 	-- WAL record is created right after the checkpoint record, which
 	-- doesn't get replayed on the mirror until something else forces it
 	-- out.
+	drop table if exists dummy;
 	create temp table dummy (id int4) distributed randomly;
 
 	-- Wait until all mirrors have replayed up to the location we
@@ -109,6 +110,23 @@ begin
 end;
 $$ language plpgsql;
 
+-- function to wait for mirror to come up in sync (10 minute timeout)
+create or replace function wait_for_mirror_sync(contentid smallint)
+	returns void as $$
+declare
+	updated bool;
+begin
+for i in 1 .. 1200 loop
+perform gp_request_fts_probe_scan();
+select (mode = 's' and status = 'u') into updated
+from gp_segment_configuration
+where content = contentid and role = 'm';
+exit when updated;
+perform pg_sleep(0.5);
+end loop;
+end;
+$$ language plpgsql;
+
 -- checkpoint to ensure clean xlog replication before bring down mirror
 select checkpoint_and_wait_for_replication_replay(500);
 
@@ -123,7 +141,7 @@ select gp_request_fts_probe_scan();
 select gp_wait_until_triggered_fault('fts_probe', 1, 1);
 
 -- stop a mirror
-select pg_ctl((select datadir from gp_segment_configuration c where c.role='m' and c.content=0), 'stop', NULL, NULL);
+select pg_ctl((select datadir from gp_segment_configuration c where c.role='m' and c.content=0), 'stop', NULL);
 
 -- checkpoint and switch the xlog to avoid corrupting the xlog due to background processes
 checkpoint;
@@ -134,7 +152,7 @@ select substring(pg_switch_xlog()::text, 0, 0) from gp_dist_random('gp_id') wher
 select move_xlog((select datadir || '/pg_xlog' from gp_segment_configuration c where c.role='p' and c.content=0), '/tmp/missing_xlog');
 
 -- bring the mirror back up
-select pg_ctl((select datadir from gp_segment_configuration c where c.role='m' and c.content=0), 'start', (select port from gp_segment_configuration where content = 0 and preferred_role = 'm'), 0);
+select pg_ctl((select datadir from gp_segment_configuration c where c.role='m' and c.content=0), 'start', (select port from gp_segment_configuration where content = 0 and preferred_role = 'm'));
 
 -- check the view, we expect to see error
 select wait_for_replication_error('walread', 0, 500);
@@ -153,3 +171,8 @@ select gp_request_fts_probe_scan();
 -- Validate that the mirror for content=0 is marked up.
 select count(*) = 2 as mirror_up from gp_segment_configuration
  where content=0 and status='u';
+-- make sure leave the test only after mirror is in sync to avoid
+-- affecting other tests. Thumb rule: leave cluster in same state as
+-- test started.
+select wait_for_mirror_sync((select dbid::smallint from gp_segment_configuration c where c.role='p' and c.content=0));
+select role, preferred_role, content, mode, status from gp_segment_configuration;

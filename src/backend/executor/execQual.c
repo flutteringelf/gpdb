@@ -73,8 +73,8 @@ static Datum ExecEvalArrayRef(ArrayRefExprState *astate,
 				 bool *isNull, ExprDoneCond *isDone);
 static bool isAssignmentIndirectionExpr(ExprState *exprstate);
 static Datum ExecEvalAggref(AggrefExprState *aggref,
-		   ExprContext *econtext,
-		   bool *isNull, ExprDoneCond *isDone);
+			   ExprContext *econtext,
+			   bool *isNull, ExprDoneCond *isDone);
 static Datum ExecEvalGroupingFunc(GroupingFuncExprState *gstate,
 							  ExprContext *econtext,
 							  bool *isNull, ExprDoneCond *isDone);
@@ -1133,12 +1133,6 @@ ExecEvalWholeRowSlow(WholeRowVarExprState *wrvstate, ExprContext *econtext,
 	if (isDone)
 		*isDone = ExprSingleResult;
 	*isNull = false;
-
-	/*
-	 * GPDB_92_MERGE_FIXME: Previous code does not have the code block below, 
-	 * but in theory this is needed. So why there is not test failure on gpdb master?
-	 * Besides, we should consider to follow pg to use ExecEvalVar() for Var code entrance.
-	 */
 
 	/* Get the input slot we want */
 	switch (variable->varno)
@@ -5213,18 +5207,18 @@ ExecEvalArrayCoerceExpr(ArrayCoerceExprState *astate,
 }
 
 /* ----------------------------------------------------------------
- *    ExecEvalCurrentOfExpr
+ *		ExecEvalCurrentOfExpr
  *
- *    Evaluate CURRENT OF
+ * Evaluate CURRENT OF
  *
- *    Constant folding must have bound observed values of
- * 	gp_segment_id, ctid, and tableoid into the CurrentOfExpr for
- *	this function's consumption.
+ * Constant folding must have bound observed values of gp_segment_id,
+ * ctid, and tableoid into the CurrentOfExpr for this function's
+ * consumption.
  * ----------------------------------------------------------------
  */
 static Datum
 ExecEvalCurrentOfExpr(ExprState *exprstate, ExprContext *econtext,
-						bool *isNull, ExprDoneCond *isDone)
+					  bool *isNull, ExprDoneCond *isDone)
 {
 	CurrentOfExpr 	*cexpr = (CurrentOfExpr *) exprstate->expr;
 	bool 			result = false;
@@ -5263,7 +5257,7 @@ ExecEvalCurrentOfExpr(ExprState *exprstate, ExprContext *econtext,
 
 	return BoolGetDatum(result);
 }
- 
+
 /* ----------------------------------------------------------------
  *		ExecEvalReshuffleExpr
  *
@@ -5444,7 +5438,6 @@ ExecInitExpr(Expr *node, PlanState *parent)
 			state->evalfunc = ExecEvalCaseTestExpr;
 			break;
 		case T_Aggref:
-
 			{
 				Aggref	   *aggref = (Aggref *) node;
 				AggrefExprState *astate = makeNode(AggrefExprState);
@@ -6196,22 +6189,21 @@ ExecInitExpr(Expr *node, PlanState *parent)
 			{
 				ReshuffleExpr *sr = (ReshuffleExpr *) node;
 				ReshuffleExprState *exprstate = makeNode(ReshuffleExprState);
-				Oid		   *typeoids;
+				Oid		   *hashFuncs;
 				int			i;
 				ListCell   *lc;
 
 				exprstate->hashKeys = (List *) ExecInitExpr((Expr *) sr->hashKeys, parent);
 				exprstate->xprstate.evalfunc = (ExprStateEvalFunc) ExecEvalReshuffleExpr;
 
-				typeoids = (Oid *) palloc(list_length(sr->hashKeys) * sizeof(Oid));
-
+				hashFuncs = palloc(list_length(sr->hashFuncs) * sizeof(Oid));
 				i = 0;
-				foreach(lc, sr->hashTypes)
+				foreach(lc, sr->hashFuncs)
 				{
-					typeoids[i++] = lfirst_oid(lc);
+					hashFuncs[i++] = lfirst_oid(lc);
 				}
 
-				exprstate->cdbhash = makeCdbHash(sr->newSegs, list_length(sr->hashTypes), typeoids);
+				exprstate->cdbhash = makeCdbHash(sr->newSegs, list_length(sr->hashKeys), hashFuncs);
 
 				state = (ExprState *) exprstate;
 			}

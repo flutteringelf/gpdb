@@ -577,6 +577,7 @@ DECLARE
     skewaot bool;
     skewsegid int;
     skewtablename record;
+    skewreplicated record;
 
 BEGIN
 
@@ -602,18 +603,35 @@ BEGIN
         SELECT * INTO skewtablename FROM gp_toolkit.__gp_fullname
         WHERE fnoid = $1;
 
-        OPEN skewcrs
-            FOR
-            EXECUTE
-                'SELECT ' || $1 || '::oid, segid, CASE WHEN gp_segment_id IS NULL THEN 0 ELSE cnt END ' ||
-                'FROM (SELECT generate_series(0, numsegments - 1) FROM gp_toolkit.__gp_number_of_segments) segs(segid) ' ||
-                'LEFT OUTER JOIN ' ||
-                    '(SELECT gp_segment_id, COUNT(*) AS cnt FROM ' ||
+        SELECT * INTO skewreplicated FROM gp_distribution_policy WHERE policytype = 'r' AND localoid = $1;
+
+        IF FOUND THEN
+            -- replicated table, gp_segment_id is user-invisible and all replicas have same count of tuples.
+            OPEN skewcrs
+                FOR
+                EXECUTE
+                    'SELECT ' || $1 || '::oid, segid, ' ||
+                    '(' ||
+                        'SELECT COUNT(*) AS cnt FROM ' ||
                         quote_ident(skewtablename.fnnspname) ||
                         '.' ||
                         quote_ident(skewtablename.fnrelname) ||
-                    ' GROUP BY 1) details ' ||
-                'ON segid = gp_segment_id';
+                    ') '
+                    'FROM (SELECT generate_series(0, numsegments - 1) FROM gp_toolkit.__gp_number_of_segments) segs(segid)';
+        ELSE
+            OPEN skewcrs
+                FOR
+                EXECUTE
+                    'SELECT ' || $1 || '::oid, segid, CASE WHEN gp_segment_id IS NULL THEN 0 ELSE cnt END ' ||
+                    'FROM (SELECT generate_series(0, numsegments - 1) FROM gp_toolkit.__gp_number_of_segments) segs(segid) ' ||
+                    'LEFT OUTER JOIN ' ||
+                        '(SELECT gp_segment_id, COUNT(*) AS cnt FROM ' ||
+                            quote_ident(skewtablename.fnnspname) ||
+                            '.' ||
+                            quote_ident(skewtablename.fnrelname) ||
+                        ' GROUP BY 1) details ' ||
+                    'ON segid = gp_segment_id';
+        END IF;
 
         FOR skewsegid IN
             SELECT generate_series(1, numsegments)
@@ -2079,15 +2097,11 @@ LANGUAGE C IMMUTABLE STRICT NO SQL;
 -- @out:
 --        int - segment id
 --        text - path to workfile set,
---        int - hash value of the spilling operator,
 --        bigint - size in bytes,
---        int - state,
---        int - workmem in kilobytes,
---        int - type of the spilling operator,
+--        text - type of the spilling operation,
 --        int - containing slice,
 --        int - sessionid,
 --        int - command_cnt,
---        timestamptz - time of query start,
 --        int - number of files
 --
 -- @doc:
@@ -2124,48 +2138,38 @@ WITH all_entries AS (
    SELECT C.*
           FROM gp_toolkit.__gp_workfile_entries_f_on_master() AS C (
             segid int,
-            path text,
-            hash int,
+            prefix text,
             size bigint,
-            state int,
-            workmem int,
             optype text,
             slice int,
             sessionid int,
             commandid int,
-            query_start timestamptz,
             numfiles int
           )
     UNION ALL
     SELECT C.*
           FROM gp_toolkit.__gp_workfile_entries_f_on_segments() AS C (
             segid int,
-            path text,
-            hash int,
+            prefix text,
             size bigint,
-            state int,
-            workmem int,
             optype text,
             slice int,
             sessionid int,
             commandid int,
-            query_start timestamptz,
             numfiles int
           ))
 SELECT S.datname,
-       (CASE WHEN (C.state = 1) THEN S.pid ELSE NULL END) AS pid,
+       S.pid,
        C.sessionid as sess_id,
        C.commandid as command_cnt,
        S.usename,
-       (CASE WHEN (C.state = 1) THEN S.query ELSE NULL END) as query,
+       S.query,
        C.segid,
        C.slice,
        C.optype,
-       C.workmem,
        C.size,
        C.numfiles,
-       C.path as directory,
-       (CASE WHEN (C.state = 1) THEN 'RUNNING' WHEN (C.state = 2) THEN 'CACHED' WHEN (C.state = 3) THEN 'DELETING' ELSE 'UNKNOWN' END) as state
+       C.prefix
 FROM all_entries C LEFT OUTER JOIN
 pg_stat_activity as S
 ON C.sessionid = S.sess_id;
@@ -2204,10 +2208,10 @@ GRANT SELECT ON gp_toolkit.gp_workfile_usage_per_segment TO public;
 --------------------------------------------------------------------------------
 
 CREATE VIEW gp_toolkit.gp_workfile_usage_per_query AS
-SELECT datname, pid, sess_id, command_cnt, usename, query, segid, state,
+SELECT datname, pid, sess_id, command_cnt, usename, query, segid,
     SUM(size) AS size, SUM(numfiles) AS numfiles
 FROM gp_toolkit.gp_workfile_entries
-GROUP BY (datname, pid, sess_id, command_cnt, usename, query, segid, state);
+GROUP BY (datname, pid, sess_id, command_cnt, usename, query, segid);
 
 GRANT SELECT ON gp_toolkit.gp_workfile_usage_per_query TO public;
 

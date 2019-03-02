@@ -49,7 +49,6 @@ gDatabaseFiles = [
     "postmaster.log",
     "postmaster.opts",
     "postmaster.pid",
-    "gp_dbid"
 ]
 
 
@@ -247,7 +246,7 @@ class GpMirrorListToBuild:
 
                 seg = toRecover.getFailoverSegment()
             seg.setSegmentStatus(gparray.STATUS_DOWN)  # down initially, we haven't started it yet
-            seg.setSegmentMode(gparray.MODE_RESYNCHRONIZATION)
+            seg.setSegmentMode(gparray.MODE_NOT_SYNC)
 
         # figure out what needs to be started or transitioned
         mirrorsToStart = []
@@ -271,10 +270,9 @@ class GpMirrorListToBuild:
                and seg.getSegmentRole() == gparray.ROLE_MIRROR:
                 rewindInfo.append((seg, primarySeg.getSegmentHostName(), primarySeg.getSegmentPort()))
 
-            # The change in configuration to of the mirror to down requires
-            # that the primary also be change to change tracking if required.
-            if primarySeg.getSegmentMode() != gparray.MODE_CHANGELOGGING:
-                primarySeg.setSegmentMode(gparray.MODE_CHANGELOGGING)
+            # The change in configuration to of the mirror to down requires that
+            # the primary also be marked as unsynchronized.
+            primarySeg.setSegmentMode(gparray.MODE_NOT_SYNC)
             primariesToConvert.append(primarySeg)
             convertPrimaryUsingFullResync.append(toRecover.isFullSynchronization())
 
@@ -325,6 +323,15 @@ class GpMirrorListToBuild:
             conn = dbconn.connect(dburl, utility=True)
             dbconn.execSQL(conn, "CHECKPOINT")
 
+            # If the postmaster.pid still exists and another process
+            # is actively using that pid, pg_rewind will fail when it
+            # tries to start the failed segment in single-user
+            # mode. It should be safe to remove the postmaster.pid
+            # file since we do not expect the failed segment to be up.
+            self.remove_postmaster_pid_from_remotehost(
+                targetSegment.getSegmentHostName(),
+                targetSegment.getSegmentDataDirectory())
+
             # Run pg_rewind to do incremental recovery.
             cmd = gp.SegmentRewind('segment rewind',
                                    targetSegment.getSegmentHostName(),
@@ -341,6 +348,16 @@ class GpMirrorListToBuild:
                 rewindFailedSegments.append(targetSegment)
 
         return rewindFailedSegments
+
+    def remove_postmaster_pid_from_remotehost(self, host, datadir):
+        cmd = base.Command(name = 'remove the postmaster.pid file',
+                           cmdStr = 'rm -f %s/postmaster.pid' % datadir,
+                           ctxt=gp.REMOTE, remoteHost = host)
+        cmd.run()
+
+        return_code = cmd.get_return_code()
+        if return_code != 0:
+            raise ExecutionError("Failed while trying to remove postmaster.pid.", cmd)
 
     def checkForPortAndDirectoryConflicts(self, gpArray):
         """
@@ -378,7 +395,11 @@ class GpMirrorListToBuild:
         for cmd in cmds:
             self.__pool.addCommand(cmd)
 
-        self.__pool.wait_and_printdots(len(cmds), self.__quiet)
+        if self.__quiet:
+            self.__pool.join()
+        else:
+            base.join_and_indicate_progress(self.__pool)
+
         if not suppressErrorCheck:
             self.__pool.check_results()
         self.__pool.empty_completed_items()
@@ -420,8 +441,10 @@ class GpMirrorListToBuild:
         def createConfigureNewSegmentCommand(hostName, cmdLabel, validationOnly):
             segmentInfo = newSegmentInfo[hostName]
             checkNotNone("segmentInfo for %s" % hostName, segmentInfo)
+
             return gp.ConfigureNewSegment(cmdLabel,
                                           segmentInfo,
+                                          gplog.get_logger_dir(),
                                           newSegments=True,
                                           verbose=gplog.logging_is_verbose(),
                                           batchSize=self.__parallelDegree,
@@ -439,7 +462,12 @@ class GpMirrorListToBuild:
             cmds.append(createConfigureNewSegmentCommand(hostName, 'validate blank segments', True))
         for cmd in cmds:
             self.__pool.addCommand(cmd)
-        self.__pool.wait_and_printdots(len(cmds), self.__quiet)
+
+        if self.__quiet:
+            self.__pool.join()
+        else:
+            base.join_and_indicate_progress(self.__pool)
+
         validationErrors = []
         for item in self.__pool.getCompletedItems():
             results = item.get_results()
@@ -680,6 +708,7 @@ class GpMirrorListToBuild:
             checkNotNone("segmentInfo for %s" % hostName, segmentInfo)
             cmd = gp.ConfigureNewSegment("update gpid file",
                                          segmentInfo,
+                                         gplog.get_logger_dir(),
                                          newSegments=False,
                                          verbose=gplog.logging_is_verbose(),
                                          batchSize=self.__parallelDegree,

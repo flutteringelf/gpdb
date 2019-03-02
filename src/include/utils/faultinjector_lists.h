@@ -106,8 +106,8 @@ FI_IDENT(DtmBroadcastAbortPrepared, "dtm_broadcast_abort_prepared")
 FI_IDENT(DtmXLogDistributedCommit, "dtm_xlog_distributed_commit")
 /* inject fault before initializing dtm */
 FI_IDENT(DtmInit, "dtm_init")
-/* inject sleep after creation of two phase file */
-FI_IDENT(EndPreparedTwoPhaseSleep, "end_prepare_two_phase_sleep")
+/* inject fault after writing prepare record */
+FI_IDENT(EndPreparedTwoPhase, "end_prepare_two_phase")
 /* inject fault after segment receives state transition request (sleep after creating two phase files) */
 FI_IDENT(SegmentTransitionRequest, "segment_transition_request")
 /* inject fault after segment is probed by FTS */
@@ -253,6 +253,10 @@ FI_IDENT(CreateGangInProgress, "create_gang_in_progress")
 FI_IDENT(DecreaseToastMaxChunkSize, "decrease_toast_max_chunk_size")
 /* inject fault to let cleanupGang return false */
 FI_IDENT(CleanupQE, "cleanup_qe")
+/* inject fault in xLog_ao_insert() just before writing AO xlog record */
+FI_IDENT(XLogAoInsert, "xlog_ao_insert")
+/* inject fault just before commiting alter database set tablespace */
+FI_IDENT(InsideMoveDbTransaction, "inside_move_db_transaction")
 #endif
 
 /*

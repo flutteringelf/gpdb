@@ -2,6 +2,16 @@ test: select_dropped_table
 # test update hash col under utility mode
 test: update_hash_col_utilitymode
 
+# Tests for crash recovery
+test: uao_crash_compaction_column
+test: uao_crash_compaction_row
+test: crash_recovery
+test: crash_recovery_redundant_dtx
+test: crash_recovery_dtm
+test: unlogged_heap_tables
+test: unlogged_appendonly_tables
+test: udf_exception_blocks_panic_scenarios
+
 # Tests on global deadlock detector
 test: select_for_update
 test: gdd/prepare
@@ -12,6 +22,8 @@ ignore: gdd/non-lock-107
 test: gdd/avoid-qd-deadlock
 test: gdd/prepare-for-local
 test: gdd/local-deadlock-03
+# gdd end
+test: gdd/end
 
 test: pg_terminate_backend deadlock_under_entry_db_singleton starve_case pg_views_concurrent_drop alter_blocks_for_update_and_viceversa drop_rename reader_waits_for_lock resource_queue
 
@@ -137,17 +149,8 @@ test: segwalrep/fts_unblock_primary
 test: segwalrep/mirror_promotion
 test: segwalrep/cancel_commit_pending_replication
 test: segwalrep/twophase_tolerance_with_mirror_promotion
-test: segwalrep/pg_basebackup
-
-# Tests for crash recovery
-test: crash_recovery
-test: crash_recovery_redundant_dtx
-test: crash_recovery_dtm
-test: uao_crash_compaction_row
-test: uao_crash_compaction_column
-test: unlogged_heap_tables
-test: unlogged_appendonly_tables
-test: udf_exception_blocks_panic_scenarios
+test: pg_basebackup
+test: pg_basebackup_with_tablespaces
 
 # Reindex tests
 test: reindex/abort_reindex
@@ -170,4 +173,10 @@ test: reindex/vacuum_while_reindex_ao_bitmap reindex/vacuum_while_reindex_heap_b
 # Cancel test
 test: cancel_plpython
 
+# Test concurrent UPDATE
 test: concurrent_update
+test: concurrent_update_distkeys
+test: concurrent_update_epq
+
+# Tests for getting numsegments in utility mode
+test: upgrade_numsegments

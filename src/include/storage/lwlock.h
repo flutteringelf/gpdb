@@ -138,7 +138,8 @@ extern PGDLLIMPORT LWLockPadded *MainLWLockArray;
 #define ErrorLogLock				(&MainLWLockArray[PG_NUM_INDIVIDUAL_LWLOCKS + 6].lock)
 #define SessionStateLock			(&MainLWLockArray[PG_NUM_INDIVIDUAL_LWLOCKS + 7].lock)
 #define RelfilenodeGenLock			(&MainLWLockArray[PG_NUM_INDIVIDUAL_LWLOCKS + 8].lock)
-#define GP_NUM_INDIVIDUAL_LWLOCKS		8
+#define WorkFileManagerLock			(&MainLWLockArray[PG_NUM_INDIVIDUAL_LWLOCKS + 9].lock)
+#define GP_NUM_INDIVIDUAL_LWLOCKS		9
 
 /*
  * It would probably be better to allocate separate LWLock tranches
@@ -163,7 +164,6 @@ extern PGDLLIMPORT LWLockPadded *MainLWLockArray;
  * It's a bit odd to declare NUM_BUFFER_PARTITIONS and NUM_LOCK_PARTITIONS
  * here, but we need them to figure out offsets within MainLWLockArray, and
  * having this file include lock.h or bufmgr.h would be backwards.
- * This also applies for WORKFILE_HASHSTABLE_NUM_PARTITIONS.
  */
 
 /* Number of partitions of the shared buffer mapping hashtable */

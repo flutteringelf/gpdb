@@ -4,7 +4,7 @@ FROM centos:centos7
 RUN yum makecache && \
     rpm --import http://mirror.centos.org/centos/RPM-GPG-KEY-CentOS-7 && \
     yum -y install epel-release java-1.8.0-openjdk-devel && \
-    yum -y install git iproute net-tools openssh-server rsync sudo vim wget unzip && \
+    yum -y install git iproute net-tools openssh-server rsync sudo time vim wget unzip && \
     yum -y install ant-junit autoconf bison cmake3 flex gperf indent jq libtool && \
     yum clean all
 
@@ -13,7 +13,7 @@ RUN yum makecache && \
     yum -y install python2-pip && \
     yum -y install python-devel python-paramiko python-psutil python-setuptools && \
     yum -y install apr-devel bzip2-devel expat-devel libcurl-devel && \
-    yum -y install libevent-devel libuuid-devel libxml2-devel libyaml-devel && \
+    yum -y install libevent-devel libuuid-devel libxml2-devel libyaml-devel libzstd-devel && \
     yum -y install openssl-devel pam-devel readline-devel snappy-devel && \
     yum -y install apache-ivy libicu perl-ExtUtils-Embed perl-Env perl-JSON && \
     pip install psi lockfile && \

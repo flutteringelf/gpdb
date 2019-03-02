@@ -312,6 +312,7 @@ typedef struct Result
 
 	int			numHashFilterCols;
 	AttrNumber *hashFilterColIdx;
+	Oid		   *hashFilterFuncs;
 } Result;
 
 /* ----------------
@@ -976,6 +977,7 @@ typedef struct Material
 {
 	Plan		plan;
 	bool		cdb_strict;
+	bool		cdb_shield_child_from_rescans;
 
 	/* Material can be shared */
 	ShareType 	share_type;
@@ -1277,8 +1279,8 @@ typedef struct Motion
 	int			motionID;			/* required by AMS  */
 
 	/* For Hash */
-	List		*hashExpr;			/* list of hash expressions */
-	List		*hashDataTypes;	    /* list of hash expr data type oids */
+	List		*hashExprs;			/* list of hash expressions */
+	Oid			*hashFuncs;			/* corresponding hash functions */
 
 	/*
 	 * The isBroadcast field is only used for motionType=MOTIONTYPE_FIXED,
@@ -1336,10 +1338,12 @@ typedef struct SplitUpdate
  */
 typedef struct Reshuffle
 {
-	Plan plan;
-	AttrNumber tupleSegIdx;
-	List *policyAttrs;
-	int oldSegs;
+	Plan		plan;
+	AttrNumber	tupleSegIdx;
+	int			numPolicyAttrs;
+	AttrNumber *policyAttrs;
+	Oid		   *policyHashFuncs;
+	int			oldSegs;
 	GpPolicyType ptype;
 } Reshuffle;
 

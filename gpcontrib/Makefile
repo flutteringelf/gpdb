@@ -11,7 +11,7 @@ ext_dir=$(BLD_TOP)/gpAux/ext
 top_builddir = ..
 include $(top_builddir)/src/Makefile.global
 
-.PHONY: all install clean distclean gpcloud pxf mapreduce gphdfs mkgphdfs
+.PHONY: all install clean distclean gpcloud pxf mapreduce
 
 #
 # targets built via top_builddir/GNUmakefile
@@ -24,9 +24,12 @@ recurse_targets = gp_sparse_vector \
 ifeq "$(with_zstd)" "yes"
 	recurse_targets += zstd
 endif
+ifeq "$(with_quicklz)" "yes"
+	recurse_targets += quicklz
+endif
 $(call recurse,all install clean distclean, $(recurse_targets))
 
-all: gpcloud pxf mapreduce gphdfs orafce
+all: gpcloud pxf mapreduce orafce
 
 gpcloud:
 	@if [ "$(enable_gpcloud)" = "yes" ]; then \
@@ -44,19 +47,10 @@ mapreduce:
 		$(MAKE) -C gpmapreduce; \
 	fi
 
-gphdfs:
-	@if [ "$(enable_gphdfs)" = "yes" ]; then \
-		$(MAKE) -C gphdfs; \
-	fi
-
 orafce:
 	@if [ "$(enable_orafce)" = "yes" ]; then \
 		$(MAKE) -C orafce NO_PGXS=true; \
 	fi
-
-mkgphdfs:
-	PATH=$(INSTLOC)/bin:$(PATH) $(MAKE) -C gphdfs USE_PGXS=1 install \
-		JAVA_HOME=${JAVA_HOME}
 
 install:
 	@if [ "$(enable_gpcloud)" = "yes" ]; then \
@@ -69,9 +63,6 @@ install:
 	@if [ "$(enable_pxf)" = "yes" ]; then \
 		$(MAKE) -C pxf install; \
 	fi
-	@if [ "$(enable_gphdfs)" = "yes" ]; then \
-		$(MAKE) -C gphdfs docdir=$(INSTLOC)/docs install; \
-	fi
 	@if [ "$(enable_orafce)" = "yes" ]; then \
 		$(MAKE) -C orafce NO_PGXS=true install; \
 	fi
@@ -80,7 +71,6 @@ clean:
 	if [ "$(enable_mapreduce)" = "yes" ]; then $(MAKE) -C gpmapreduce clean; fi
 	if [ "$(enable_gpcloud)" = "yes" ]; then $(MAKE) -C gpcloud cleanall; fi
 	if [ "$(enable_pxf)" = "yes" ]; then $(MAKE) -C pxf clean; fi
-	if [ "$(enable_gphdfs)" = "yes" ]; then $(MAKE) -C gphdfs clean; fi
 	if [ "${enable_orafce}" = "yes" ]; then $(MAKE) -C orafce NO_PGXS=true clean; fi
 
 
@@ -88,7 +78,6 @@ distclean:
 	if [ "$(enable_mapreduce)" = "yes" ]; then $(MAKE) -C gpmapreduce distclean; fi
 	if [ "$(enable_gpcloud)" = "yes" ]; then $(MAKE) -C gpcloud distclean; fi
 	if [ "$(enable_pxf)" = "yes" ]; then $(MAKE) -C pxf distclean; fi
-	if [ "$(enable_gphdfs)" = "yes" ]; then $(MAKE) -C gphdfs distclean; fi
 	if [ "${enable_orafce}" = "yes" ]; then $(MAKE) -C orafce NO_PGXS=true distclean; fi
 
 installcheck:
@@ -101,8 +90,13 @@ installcheck:
 ifeq "$(with_zstd)" "yes"
 	$(MAKE) -C zstd installcheck
 endif
+
+ifeq "$(with_quicklz)" "yes"
+	$(MAKE) -C quicklz installcheck
+endif
+
 	if [ -d "$(ext_dir)" ]; then \
-		PATH=$(INSTLOC)/bin:$(PATH) $(MAKE) -C gphdfs installcheck USE_PGXS=1 ; \
+		PATH=$(INSTLOC)/bin:$(PATH) $(MAKE) -C installcheck USE_PGXS=1 ; \
 	fi
 
 unittest-check:

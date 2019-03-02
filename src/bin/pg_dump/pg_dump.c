@@ -341,6 +341,7 @@ static bool testAttributeEncodingSupport(Archive *fout);
 
 static char *nextToken(register char **stringp, register const char *delim);
 static void addDistributedBy(Archive *fout, PQExpBuffer q, TableInfo *tbinfo, int actual_atts);
+static void addDistributedByOld(Archive *fout, PQExpBuffer q, TableInfo *tbinfo, int actual_atts);
 static bool isGPDB4300OrLater(Archive *fout);
 static bool isGPDB(Archive *fout);
 static bool isGPDB5000OrLater(Archive *fout);
@@ -2416,6 +2417,8 @@ buildMatViewRefreshDependencies(Archive *fout)
 		return;
 
 	query = createPQExpBuffer();
+
+	ExecuteSqlStatement(fout, "SET gp_recursive_cte_prototype TO ON;");
 
 	appendPQExpBufferStr(query, "WITH RECURSIVE w AS "
 						 "( "
@@ -5226,6 +5229,7 @@ getTables(Archive *fout, int *numTables)
 						  "LEFT JOIN pg_partition p ON pr.paroid = p.oid "
 						  "LEFT JOIN pg_partition pl ON (c.oid = pl.parrelid AND pl.parlevel = 0)"
 				   "WHERE c.relkind in ('%c', '%c', '%c', '%c', '%c', '%c') "
+						  "AND c.relnamespace <> 7012 " /* BM_BITMAPINDEX_NAMESPACE */
 						  "AND c.oid NOT IN (SELECT p.parchildrelid FROM pg_partition_rule p LEFT "
 						  "JOIN pg_exttable e ON p.parchildrelid=e.reloid WHERE e.reloid IS NULL)"
 						  "ORDER BY c.oid",
@@ -5306,6 +5310,8 @@ getTables(Archive *fout, int *numTables)
 						  "(SELECT spcname FROM pg_tablespace t WHERE t.oid = c.reltablespace) AS reltablespace, "
 						  "c.reloptions AS reloptions, "
 						  "tc.reloptions AS toast_reloptions "
+						  ", p.parrelid as parrelid, "
+						  " pl.parlevel as parlevel "
 						  "FROM pg_class c "
 						  "LEFT JOIN pg_depend d ON "
 						  "(c.relkind = '%c' AND "
@@ -7237,6 +7243,17 @@ getTableAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 				appendPQExpBuffer(q, "SELECT tableoid, oid, conname, "
 						   "pg_catalog.pg_get_constraintdef(oid) AS consrc, "
 								  "conislocal, true AS convalidated "
+								  "FROM pg_catalog.pg_constraint "
+								  "WHERE conrelid = '%u'::pg_catalog.oid "
+								  "   AND contype = 'c' "
+								  "ORDER BY conname",
+								  tbinfo->dobj.catId.oid);
+			}
+			else if (fout->remoteVersion >= 70400)
+			{
+				appendPQExpBuffer(q, "SELECT tableoid, oid, conname, "
+						   "pg_catalog.pg_get_constraintdef(oid) AS consrc, "
+								  "true AS conislocal, true AS convalidated "
 								  "FROM pg_catalog.pg_constraint "
 								  "WHERE conrelid = '%u'::pg_catalog.oid "
 								  "   AND contype = 'c' "
@@ -10304,7 +10321,7 @@ dumpFunc(Archive *fout, FuncInfo *finfo)
 					"pg_catalog.pg_get_function_arguments(oid) AS funcargs, "
 		  "pg_catalog.pg_get_function_identity_arguments(oid) AS funciargs, "
 					 "pg_catalog.pg_get_function_result(oid) AS funcresult, "
-						  "proiswindow, provolatile, proisstrict, prosecdef, "
+						  "proiswin as proiswindow, provolatile, proisstrict, prosecdef, "
 						  "false AS proleakproof, "
 						  "proconfig, procost, prorows, prodataaccess, "
 						  "'a' as proexeclocation, "
@@ -14358,9 +14375,7 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
 		/* START MPP ADDITION */
 
 		/*
-		 * Dump distributed by clause. We skip this in binary-upgrade mode,
-		 * because that runs against a single segment server, and we don't
-		 * store the distribution policy information in segments.
+		 * Dump distributed by clause.
 		 */
 		if (dumpPolicy && tbinfo->relkind != RELKIND_FOREIGN_TABLE)
 			addDistributedBy(fout, q, tbinfo, actual_atts);
@@ -14539,7 +14554,11 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
 				char tmpExtTable[500] = {0};
 				relname = pg_strdup(PQgetvalue(res, i, i_relname));
 				snprintf(tmpExtTable, sizeof(tmpExtTable), "%s%s", relname, EXT_PARTITION_NAME_POSTFIX);
-				appendPQExpBuffer(q, "ALTER TABLE %s ", fmtId(tbinfo->dobj.name));
+				char *qualTmpExtTable = pg_strdup(fmtQualifiedId(fout->remoteVersion,
+																 tbinfo->dobj.namespace->dobj.name,
+																 tmpExtTable));
+
+				appendPQExpBuffer(q, "ALTER TABLE %s ", qualrelname);
 				/*
 				 * If it is an anonymous range partition we must exchange for
 				 * the rank rather than the parname.
@@ -14554,14 +14573,15 @@ dumpTableSchema(Archive *fout, TableInfo *tbinfo)
 					appendPQExpBuffer(q, "EXCHANGE PARTITION %s ",
 									  fmtId(PQgetvalue(res, i, i_parname)));
 				}
-				appendPQExpBuffer(q, "WITH TABLE %s WITHOUT VALIDATION; ", fmtId(tmpExtTable));
+				appendPQExpBuffer(q, "WITH TABLE %s WITHOUT VALIDATION; ", qualTmpExtTable);
 
 				appendPQExpBuffer(q, "\n");
 
-				appendPQExpBuffer(q, "DROP TABLE %s; ", fmtId(tmpExtTable));
+				appendPQExpBuffer(q, "DROP TABLE %s; ", qualTmpExtTable);
 
 				appendPQExpBuffer(q, "\n");
 				free(relname);
+				free(qualTmpExtTable);
 			}
 
 			PQclear(res);
@@ -16815,22 +16835,42 @@ testExtProtocolSupport(Archive *fout)
 static void
 addDistributedBy(Archive *fout, PQExpBuffer q, TableInfo *tbinfo, int actual_atts)
 {
+	if (isGPDB6000OrLater(fout))
+	{
+		PQExpBuffer query = createPQExpBuffer();
+		PGresult   *res;
+
+		appendPQExpBuffer(query,
+						  "SELECT pg_catalog.pg_get_table_distributedby(%u)",
+						  tbinfo->dobj.catId.oid);
+
+		res = ExecuteSqlQueryForSingleRow(fout, query->data);
+
+		appendPQExpBuffer(q, " %s", PQgetvalue(res, 0, 0));
+
+		PQclear(res);
+		destroyPQExpBuffer(query);
+	}
+	else
+		addDistributedByOld(fout, q, tbinfo, actual_atts);
+}
+
+/*
+ * This is used with GPDB 5 and older, where pg_get_table_distributedby()
+ * backend function is not available.
+ */
+static void
+addDistributedByOld(Archive *fout, PQExpBuffer q, TableInfo *tbinfo, int actual_atts)
+{
 	PQExpBuffer query = createPQExpBuffer();
 	PGresult   *res;
-	char	   policytype;
 	char	   *policydef;
 	char	   *policycol;
 
-	if (isGPDB6000OrLater(fout))
-		appendPQExpBuffer(query,
-						  "SELECT attrnums, policytype FROM gp_distribution_policy as p "
-						  "WHERE p.localoid = %u",
-						  tbinfo->dobj.catId.oid);
-	else
-		appendPQExpBuffer(query,
-						  "SELECT attrnums, 'p' as policytype FROM gp_distribution_policy as p "
-						  "WHERE p.localoid = %u",
-						  tbinfo->dobj.catId.oid);
+	appendPQExpBuffer(query,
+					  "SELECT attrnums FROM pg_catalog.gp_distribution_policy as p "
+					  "WHERE p.localoid = %u",
+					  tbinfo->dobj.catId.oid);
 
 	res = ExecuteSqlQuery(fout, query->data, PGRES_TUPLES_OK);
 
@@ -16872,25 +16912,27 @@ addDistributedBy(Archive *fout, PQExpBuffer q, TableInfo *tbinfo, int actual_att
 		 * one or NULL).
 		 */
 		policydef = PQgetvalue(res, 0, 0);
-		policytype = *(char *)PQgetvalue(res, 0, 1);
 
-		if (policytype == SYM_POLICYTYPE_REPLICATED)
+		if (strlen(policydef) > 0)
 		{
-			/* policy type is 'r' - distribute replicated */
-			appendPQExpBufferStr(q, " DISTRIBUTED REPLICATED");
-		}
-		else if (strlen(policydef) > 0)
-		{
+			bool		isfirst = true;
+			char	   *separator;
+
+			appendPQExpBuffer(q, " DISTRIBUTED BY (");
+
 			/* policy indicates one or more columns to distribute on */
 			policydef[strlen(policydef) - 1] = '\0';
 			policydef++;
-			policycol = nextToken(&policydef, ",");
-			appendPQExpBuffer(q, " DISTRIBUTED BY (%s",
-							  fmtId(tbinfo->attnames[atoi(policycol) - 1]));
+			separator = ",";
+
 			while ((policycol = nextToken(&policydef, ",")) != NULL)
 			{
-				appendPQExpBuffer(q, ", %s",
-							   fmtId(tbinfo->attnames[atoi(policycol) - 1]));
+				if (!isfirst)
+					appendPQExpBuffer(q, ", ");
+				isfirst = false;
+
+				appendPQExpBuffer(q, "%s",
+								  fmtId(tbinfo->attnames[atoi(policycol) - 1]));
 			}
 			appendPQExpBufferChar(q, ')');
 		}

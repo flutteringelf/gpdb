@@ -52,6 +52,13 @@ namespace gpdxl
 {
 	using namespace gpopt;
 
+	enum DistributionHashOpsKind
+	{
+		DistrHashOpsNotDeterminedYet,
+		DistrUseDefaultHashOps,
+		DistrUseLegacyHashOps
+	};
+
 	//---------------------------------------------------------------------------
 	//	@class:
 	//		CTranslatorUtils
@@ -400,9 +407,6 @@ namespace gpdxl
 			static
 			ULONG GetNumNonSystemColumns(const IMDRelation *mdrel);
 
-			// check if we need to create stats buckets in DXL for the column attribute
-			static
-			BOOL ShouldCreateStatsBucket(OID att_type_oid);
 	};
 }
 

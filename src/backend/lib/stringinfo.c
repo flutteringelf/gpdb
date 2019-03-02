@@ -45,7 +45,7 @@ makeStringInfo(void)
 void
 initStringInfo(StringInfo str)
 {
-	int			size = 1024;		/* initial default buffer size */
+	int			size = 1024;	/* initial default buffer size */
 
 	str->data = (char *) palloc(size);
 	str->maxlen = size;
@@ -296,14 +296,8 @@ enlargeStringInfo(StringInfo str, int needed)
 	 * here that MaxAllocSize <= INT_MAX/2, else the above loop could
 	 * overflow.  We will still have newlen >= needed.
 	 */
-	if (newlen >= (int) MaxAllocSize)
-	{
-		/*
-		 * Currently we support allocations only up to MaxAllocSize - 1
-		 * (see AllocSizeIsValid()).
-		 */
-		newlen = (int) MaxAllocSize - 1;
-	}
+	if (newlen > (int) MaxAllocSize)
+		newlen = (int) MaxAllocSize;
 
 	str->data = (char *) repalloc(str->data, newlen);
 

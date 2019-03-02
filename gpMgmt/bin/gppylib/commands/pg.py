@@ -4,6 +4,7 @@
 #
 
 import os
+import pipes
 
 from gppylib.gplog import *
 from gppylib.gparray import *
@@ -172,20 +173,24 @@ class PgControlData(Command):
     def get_datadir(self):
         return self.datadir
 
+
 class PgBaseBackup(Command):
-    def __init__(self, pgdata, host, port, excludePaths=[], ctxt=LOCAL, remoteHost=None, forceoverwrite=False, target_gp_dbid=0):
-        cmd_tokens = ['pg_basebackup',
-                           '-x', '-R',
-                           '-c', 'fast']
+    def __init__(self, pgdata, host, port, replication_slot_name=None, excludePaths=[], ctxt=LOCAL, remoteHost=None, forceoverwrite=False, target_gp_dbid=0, logfile=None,
+                 recovery_mode=True):
+        cmd_tokens = ['pg_basebackup', '-c', 'fast']
         cmd_tokens.append('-D')
         cmd_tokens.append(pgdata)
         cmd_tokens.append('-h')
         cmd_tokens.append(host)
         cmd_tokens.append('-p')
         cmd_tokens.append(port)
+        cmd_tokens.extend(self._xlog_arguments(replication_slot_name))
 
         if forceoverwrite:
             cmd_tokens.append('--force-overwrite')
+
+        if recovery_mode:
+            cmd_tokens.append('--write-recovery-conf')
 
         # This is needed to handle Greenplum tablespaces
         cmd_tokens.append('--target-gp-dbid')
@@ -202,12 +207,26 @@ class PgBaseBackup(Command):
             cmd_tokens.append('./gpperfmon/logs')
             cmd_tokens.append('-E')
             cmd_tokens.append('./promote')
-            cmd_tokens.append('-E')
-            cmd_tokens.append('./gp_dbid')
         else:
             for path in excludePaths:
                 cmd_tokens.append('-E')
                 cmd_tokens.append(path)
 
+        cmd_tokens.append('--progress')
+        cmd_tokens.append('--verbose')
+
+        if logfile:
+            cmd_tokens.append('> %s 2>&1' % pipes.quote(logfile))
+
         cmd_str = ' '.join(cmd_tokens)
+
+        self.command_tokens = cmd_tokens
+
         Command.__init__(self, 'pg_basebackup', cmd_str, ctxt=ctxt, remoteHost=remoteHost)
+
+    @staticmethod
+    def _xlog_arguments(replication_slot_name):
+        if replication_slot_name:
+            return ["--slot", replication_slot_name, "--xlog-method", "stream"]
+        else:
+            return ['--xlog']

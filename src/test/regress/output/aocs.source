@@ -662,6 +662,8 @@ select indexname from pg_indexes where tablename = 'co' order by indexname;
 (4 rows)
 
 alter table co alter j type bigint;
+ERROR:  cannot alter indexed column
+HINT:  DROP the index first, and recreate it after the ALTER
 alter table co rename j to j_renamed;
 alter table co drop column j_renamed;
 select tablename, attname, avg_width, n_distinct from pg_stats where tablename = 'co' order by attname, tablename;
@@ -1023,7 +1025,7 @@ select get_ao_compression_ratio('aocs_compress_table') > 1.2 and get_ao_compress
 select get_ao_distribution('aocs_compress_table');
  get_ao_distribution 
 ---------------------
- (2,1)
+ (1,1)
 (1 row)
 
 truncate table aocs_compress_table; -- after truncate, reclaim space from the table and index

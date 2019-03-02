@@ -42,10 +42,11 @@
  */
 #define MaxAllocSize	((Size) 0x3fffffff)		/* 1 gigabyte - 1 */
 
-static inline bool AllocSizeIsValid(Size sz)
-{
-        return (sz < MaxAllocSize);
-}
+#define AllocSizeIsValid(size)	((Size) (size) <= MaxAllocSize)
+
+#define MaxAllocHugeSize	(SIZE_MAX / 2)
+
+#define AllocHugeSizeIsValid(size)	((Size) (size) <= MaxAllocHugeSize)
 
 /*
  * Multiple chunks can share a SharedChunkHeader if their shared information
@@ -64,10 +65,6 @@ typedef struct SharedChunkHeader
 	struct SharedChunkHeader *prev;
 	struct SharedChunkHeader *next;
 } SharedChunkHeader;
-
-#define MaxAllocHugeSize	(SIZE_MAX / 2)
-
-#define AllocHugeSizeIsValid(size)	((Size) (size) <= MaxAllocHugeSize)
 
 /*
  * All chunks allocated by any memory context manager are required to be
@@ -302,14 +299,6 @@ extern uint64 mpool_bytes_used(MPool *mpool);
 #define ALLOCSET_START_SMALL_SIZES \
 	ALLOCSET_SMALL_MINSIZE, ALLOCSET_SMALL_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE
 
-
-/*
- * Threshold above which a request in an AllocSet context is certain to be
- * allocated separately (and thereby have constant allocation overhead).
- * Few callers should be interested in this, but tuplesort/tuplestore need
- * to know it.
- */
-#define ALLOCSET_SEPARATE_THRESHOLD  8192
 
 /*
  * Threshold above which a request in an AllocSet context is certain to be

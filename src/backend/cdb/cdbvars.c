@@ -271,17 +271,13 @@ int			gp_workfile_caching_loglevel = DEBUG1;
 int			gp_sessionstate_loglevel = DEBUG1;
 
 /* Maximum disk space to use for workfiles on a segment, in kilobytes */
-double		gp_workfile_limit_per_segment = 0;
+int			gp_workfile_limit_per_segment = 0;
 
 /* Maximum disk space to use for workfiles per query on a segment, in kilobytes */
-double		gp_workfile_limit_per_query = 0;
+int			gp_workfile_limit_per_query = 0;
 
 /* Maximum number of workfiles to be created by a query */
 int			gp_workfile_limit_files_per_query = 0;
-int			gp_workfile_bytes_to_checksum = 16;
-
-/* The type of work files that HashJoin should use */
-int			gp_workfile_type_hashjoin = 0;
 
 /* Gpmon */
 bool		gp_enable_gpperfmon = false;
@@ -721,15 +717,20 @@ gpvars_check_statement_mem(int *newval, void **extra, GucSource source)
 /*
  * increment_command_count
  *	  Increment gp_command_count. If the new command count is 0 or a negative number, reset it to 1.
+ *	  And keep MyProc->queryCommandId synced with gp_command_count.
  */
 void
 increment_command_count()
 {
 	gp_command_count++;
 	if (gp_command_count <= 0)
-	{
 		gp_command_count = 1;
-	}
+
+	/*
+	 * No need to maintain MyProc->queryCommandId elsewhere, we guarantee
+	 * they are always synced here.
+	 */
+	MyProc->queryCommandId = gp_command_count;
 }
 
 Datum mpp_execution_segment(PG_FUNCTION_ARGS);

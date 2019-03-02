@@ -141,14 +141,14 @@ show vacuum_freeze_min_age;
 
 select relname from pg_class where relname like 'ao_age_test%'
 order by relname;
-        relname         
-------------------------
+          relname           
+----------------------------
  ao_age_test
  ao_age_test_1_prt_b1
+ ao_age_test_1_prt_b1_i_idx
  ao_age_test_1_prt_b2
+ ao_age_test_1_prt_b2_i_idx
  ao_age_test_i
- ao_age_test_i_1_prt_b1
- ao_age_test_i_1_prt_b2
 (6 rows)
 
 vacuum ao_age_test;
@@ -328,3 +328,8 @@ SELECT relname, reltuples, relpages FROM pg_catalog.pg_class WHERE relname like 
 (3 rows)
 
 reset gp_autostats_mode;
+-- Check forbidden relkind for vacuum is correctly skipped
+CREATE SEQUENCE s_serial START 100;
+VACUUM (ANALYZE, VERBOSE) s_serial;
+WARNING:  skipping "s_serial" --- cannot vacuum non-tables or special system tables
+DROP SEQUENCE s_serial;

@@ -25,8 +25,8 @@ SELECT depname, empno, salary, sum(salary) OVER (PARTITION BY depname) FROM emps
 -----------+-------+--------+-------
  develop   |     7 |   4200 | 25100
  develop   |     9 |   4500 | 25100
- develop   |    11 |   5200 | 25100
  develop   |    10 |   5200 | 25100
+ develop   |    11 |   5200 | 25100
  develop   |     8 |   6000 | 25100
  personnel |     5 |   3500 |  7400
  personnel |     2 |   3900 |  7400
@@ -1114,6 +1114,81 @@ FROM empsalary;
                      ->  Seq Scan on empsalary
  Optimizer: legacy query optimizer
 (11 rows)
+
+-- Test pushdown of quals into a subquery containing window functions
+-- pushdown is safe because all PARTITION BY clauses include depname:
+EXPLAIN (COSTS OFF)
+SELECT * FROM
+  (SELECT depname,
+          sum(salary) OVER (PARTITION BY depname) depsalary,
+          min(salary) OVER (PARTITION BY depname || 'A', depname) depminsalary
+   FROM empsalary) emp
+WHERE depname = 'sales';
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Gather Motion 1:1  (slice1; segments: 1)
+   ->  Subquery Scan on emp
+         ->  WindowAgg
+               ->  WindowAgg
+                     Partition By: (((empsalary.depname)::text || 'A'::text))
+                     ->  Sort
+                           Sort Key: (((empsalary.depname)::text || 'A'::text))
+                           ->  Seq Scan on empsalary
+                                 Filter: ((depname)::text = 'sales'::text)
+ Optimizer: legacy query optimizer
+(10 rows)
+
+-- pushdown is unsafe because there's a PARTITION BY clause without depname:
+EXPLAIN (COSTS OFF)
+SELECT * FROM
+  (SELECT depname,
+          sum(salary) OVER (PARTITION BY enroll_date) enroll_salary,
+          min(salary) OVER (PARTITION BY depname) depminsalary
+   FROM empsalary) emp
+WHERE depname = 'sales';
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Gather Motion 3:1  (slice2; segments: 3)
+   ->  Subquery Scan on emp
+         Filter: ((emp.depname)::text = 'sales'::text)
+         ->  WindowAgg
+               Partition By: empsalary.enroll_date
+               ->  Sort
+                     Sort Key: empsalary.enroll_date
+                     ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                           Hash Key: empsalary.enroll_date
+                           ->  WindowAgg
+                                 Partition By: empsalary.depname
+                                 ->  Sort
+                                       Sort Key: empsalary.depname
+                                       ->  Seq Scan on empsalary
+ Optimizer: legacy query optimizer
+(15 rows)
+
+-- pushdown is unsafe because the subquery contains window functions and the qual is volatile:
+EXPLAIN (COSTS OFF)
+SELECT * FROM
+  (SELECT depname,
+          sum(salary) OVER (PARTITION BY depname) depsalary,
+          min(salary) OVER (PARTITION BY depname || 'A', depname) depminsalary
+   FROM empsalary) emp
+WHERE depname = 'sales' OR RANDOM() > 0.5;
+                                               QUERY PLAN                                                
+---------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Subquery Scan on emp
+         Filter: (((emp.depname)::text = 'sales'::text) OR (random() > 0.5::double precision))
+         ->  WindowAgg
+               Partition By: empsalary.depname
+               ->  Sort
+                     Sort Key: empsalary.depname
+                     ->  WindowAgg
+                           Partition By: (((empsalary.depname)::text || 'A'::text)), empsalary.depname
+                           ->  Sort
+                                 Sort Key: (((empsalary.depname)::text || 'A'::text)), empsalary.depname
+                                 ->  Seq Scan on empsalary
+ Optimizer: legacy query optimizer
+(13 rows)
 
 -- cleanup
 DROP TABLE empsalary;

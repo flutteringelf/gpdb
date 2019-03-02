@@ -212,10 +212,9 @@ Feature: gpcheckcat tests
         When the user runs "gpcheckcat -R distribution_policy constraint_db"
         Then gpcheckcat should return a return code of 1
         Then validate and run gpcheckcat repair
-        When the user runs "gpcheckcat -R constraint constraint_db"
-        Then the path "gpcheckcat.repair.*" is found in cwd "0" times
+        When the user runs "gpcheckcat -R distribution_policy constraint_db"
+        Then gpcheckcat should return a return code of 0
         And the user runs "dropdb constraint_db"
-        And the path "gpcheckcat.repair.*" is removed from current working directory
 
     @policy
     Scenario: gpcheckcat should report and repair invalid policy issues
@@ -374,7 +373,7 @@ Feature: gpcheckcat tests
     Scenario: gpcheckcat should generate repair scripts when only -g option is provided
         Given database "constraint_g_db" is dropped and recreated
         And the user runs "psql constraint_g_db -c "create table foo(i int primary key);""
-        And the user runs sql "set allow_system_table_mods=true; update gp_distribution_policy  set attrnums=NULL where localoid='foo'::regclass::oid;" in "constraint_g_db" on all the segments
+        And the user runs sql "set allow_system_table_mods=true; update gp_distribution_policy  set distkey='', distclass='' where localoid='foo'::regclass::oid;" in "constraint_g_db" on all the segments
         Then psql should return a return code of 0
         When the user runs "gpcheckcat -g repair_dir constraint_g_db"
         Then gpcheckcat should return a return code of 1
@@ -426,3 +425,137 @@ Feature: gpcheckcat tests
         Then gpcheckcat should print "Name of test which found this issue: dependency_pg_type" to stdout
         Then gpcheckcat should print "Table pg_type has a dependency issue on oid .* at content 0" to stdout
         And the user runs "dropdb gpcheckcat_dependency"
+
+    @orphaned_toast
+    Scenario: gpcheckcat should repair "bad reference" orphaned toast tables (caused by missing reltoastrelid)
+        Given the database "gpcheckcat_orphans" is broken with "bad reference" orphaned toast tables
+        When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+        Then gpcheckcat should return a return code of 1
+        And gpcheckcat should print "catalog issue\(s\) found , repair script\(s\) generated" to stdout
+        And gpcheckcat should print "To fix, run the generated repair script which updates a pg_class entry using the correct dependent table OID for reltoastrelid" to stdout
+        And run all the repair scripts in the dir "repair_dir"
+        When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+        And gpcheckcat should print "Found no catalog issue" to stdout
+        And the user runs "dropdb gpcheckcat_orphans"
+        And the path "repair_dir" is removed from current working directory
+
+    @orphaned_toast
+    Scenario: gpcheckcat should repair "bad dependency" orphaned toast tables (caused by missing pg_depend entry)
+        Given the database "gpcheckcat_orphans" is broken with "bad dependency" orphaned toast tables
+        When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+        Then gpcheckcat should return a return code of 1
+        And gpcheckcat should print "catalog issue\(s\) found , repair script\(s\) generated" to stdout
+        And gpcheckcat should print "To fix, run the generated repair script which inserts a pg_depend entry using the correct dependent table OID for refobjid" to stdout
+        And run all the repair scripts in the dir "repair_dir"
+        When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+        And gpcheckcat should print "Found no catalog issue" to stdout
+        And the user runs "dropdb gpcheckcat_orphans"
+        And the path "repair_dir" is removed from current working directory
+
+    @orphaned_toast
+    Scenario: gpcheckcat should log and not attempt to repair "double orphan - no parent" orphaned toast tables (caused by both missing reltoastrelid and missing pg_depend entry)
+        Given the database "gpcheckcat_orphans" is broken with "double orphan - no parent" orphaned toast tables
+        When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+        Then gpcheckcat should return a return code of 1
+        And gpcheckcat should print "catalog issue\(s\) found , repair script\(s\) generated" to stdout
+        And gpcheckcat should print "The parent table does not exist. Therefore, the toast table" to stdout
+        And run all the repair scripts in the dir "repair_dir"
+        When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+        And gpcheckcat should print "catalog issue\(s\) found , repair script\(s\) generated" to stdout
+        And the user runs "dropdb gpcheckcat_orphans"
+        And the path "repair_dir" is removed from current working directory
+
+    @orphaned_toast
+    Scenario: gpcheckcat should log and not attempt to repair "double orphan - valid parent" orphaned toast tables (caused by both missing reltoastrelid and missing pg_depend entry)
+        Given the database "gpcheckcat_orphans" is broken with "double orphan - valid parent" orphaned toast tables
+        When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+        Then gpcheckcat should return a return code of 1
+        And gpcheckcat should print "catalog issue\(s\) found , repair script\(s\) generated" to stdout
+        And gpcheckcat should print "The parent table already references a valid toast table" to stdout
+        And run all the repair scripts in the dir "repair_dir"
+        When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+        And gpcheckcat should print "catalog issue\(s\) found , repair script\(s\) generated" to stdout
+        And the user runs "dropdb gpcheckcat_orphans"
+        And the path "repair_dir" is removed from current working directory
+
+    @orphaned_toast
+    Scenario: gpcheckcat should log and not attempt to repair "double orphan - invalid parent" orphaned toast tables (caused by both missing reltoastrelid and missing pg_depend entry)
+        Given the database "gpcheckcat_orphans" is broken with "double orphan - invalid parent" orphaned toast tables
+        When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+        Then gpcheckcat should return a return code of 1
+        And gpcheckcat should print "catalog issue\(s\) found , repair script\(s\) generated" to stdout
+        And gpcheckcat should print "Verify that the parent table requires a toast table." to stdout
+        And run all the repair scripts in the dir "repair_dir"
+        When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+        And gpcheckcat should print "catalog issue\(s\) found , repair script\(s\) generated" to stdout
+        And the user runs "dropdb gpcheckcat_orphans"
+        And the path "repair_dir" is removed from current working directory
+
+    @orphaned_toast
+    Scenario: gpcheckcat should log and not repair "mismatched non-cyclic" orphaned toast tables (caused by non-matching reltoastrelid)
+        Given the database "gpcheckcat_orphans" is broken with "mismatched non-cyclic" orphaned toast tables
+        When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+        Then gpcheckcat should return a return code of 1
+        And gpcheckcat should print "catalog issue\(s\) found , repair script\(s\) generated" to stdout
+        And gpcheckcat should print "A manual catalog change is needed to fix by updating the pg_depend TOAST table entry and setting the refobjid field to the correct dependent table" to stdout
+        And run all the repair scripts in the dir "repair_dir"
+        When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+        And gpcheckcat should print "catalog issue\(s\) found , repair script\(s\) generated" to stdout
+        And gpcheckcat should print "A manual catalog change is needed" to stdout
+        And the user runs "dropdb gpcheckcat_orphans"
+        And the path "repair_dir" is removed from current working directory
+
+    @orphaned_toast
+    Scenario: gpcheckcat should log and not attempt to repair "mismatched cyclic" orphaned toast tables
+        Given the database "gpcheckcat_orphans" is broken with "mismatched cyclic" orphaned toast tables
+        When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+        Then gpcheckcat should return a return code of 1
+        And gpcheckcat should print "catalog issue\(s\) found , repair script\(s\) generated" to stdout
+        And gpcheckcat should print "A manual catalog change is needed to fix by updating the pg_depend TOAST table entry and setting the refobjid field to the correct dependent table" to stdout
+        And run all the repair scripts in the dir "repair_dir"
+        When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+        And gpcheckcat should print "catalog issue\(s\) found , repair script\(s\) generated" to stdout
+        And gpcheckcat should print "A manual catalog change is needed" to stdout
+        And the user runs "dropdb gpcheckcat_orphans"
+        And the path "repair_dir" is removed from current working directory
+
+    @orphaned_toast
+    Scenario: gpcheckcat should repair orphaned toast tables that are only orphaned on some segments
+        Given the database "gpcheckcat_orphans" is broken with "bad reference" orphaned toast tables only on segments with content IDs "0, 1"
+        When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+        Then gpcheckcat should return a return code of 1
+        And gpcheckcat should print "On segment\(s\) 0, 1 table" to stdout
+        And gpcheckcat should print "catalog issue\(s\) found , repair script\(s\) generated" to stdout
+        And run all the repair scripts in the dir "repair_dir"
+        When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+        And gpcheckcat should print "Found no catalog issue" to stdout
+        And the user runs "dropdb gpcheckcat_orphans"
+        And the path "repair_dir" is removed from current working directory
+
+    @orphaned_toast
+    Scenario: gpcheckcat should repair orphaned toast tables that are only orphaned on the master
+		# TODO: should we just combine this into the test above?
+        Given the database "gpcheckcat_orphans" is broken with "bad reference" orphaned toast tables only on segments with content IDs "-1"
+        When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+        Then gpcheckcat should return a return code of 1
+        And gpcheckcat should print "On segment\(s\) -1 table" to stdout
+        And gpcheckcat should print "catalog issue\(s\) found , repair script\(s\) generated" to stdout
+        And run all the repair scripts in the dir "repair_dir"
+        When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+        And gpcheckcat should print "Found no catalog issue" to stdout
+        And the user runs "dropdb gpcheckcat_orphans"
+        And the path "repair_dir" is removed from current working directory
+
+    @orphaned_toast
+    Scenario: gpcheckcat should repair tables that are orphaned in different ways per segment
+        Given the database "gpcheckcat_orphans" has a table that is orphaned in multiple ways
+         When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+         Then gpcheckcat should return a return code of 1
+          And gpcheckcat should print "Found a \"bad reference\" orphaned TOAST table caused by missing a reltoastrelid in pg_class." to stdout
+          And gpcheckcat should print "Found a \"bad dependency\" orphaned TOAST table caused by missing a pg_depend entry." to stdout
+          And gpcheckcat should print "catalog issue\(s\) found , repair script\(s\) generated" to stdout
+          And run all the repair scripts in the dir "repair_dir"
+         When the user runs "gpcheckcat -R orphaned_toast_tables -g repair_dir gpcheckcat_orphans"
+         Then gpcheckcat should print "Found no catalog issue" to stdout
+          And the user runs "dropdb gpcheckcat_orphans"
+          And the path "repair_dir" is removed from current working directory

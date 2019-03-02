@@ -67,8 +67,7 @@ typedef struct AggClauseCosts
 {
 	int			numAggs;		/* total number of aggregate functions */
 	int			numOrderedAggs; /* number w/ DISTINCT/ORDER BY/WITHIN GROUP */
-	/* GPDB_94_MERGE_FIXME: does numPureOrderedAggs include WITHIN GROUP aggs? Should it? */
-	int			numPureOrderedAggs; /* CDB: number that use ORDER BY, not counting DISTINCT */
+	int			numPureOrderedAggs; /* CDB: number that use ORDER BY/WITHIN GROUP, not counting DISTINCT */
 	bool		hasNonCombine;	/* CDB: any agg func w/o a combine func? */
 	bool		hasNonSerial;	/* CDB: is any partial agg non-serializable? */
 	QualCost	transCost;		/* total per-input-row execution costs */
@@ -307,9 +306,10 @@ typedef struct PlannerInfo
 	/* optional private data for join_search_hook, e.g., GEQO */
 	void	   *join_search_private;
 
-	int		   upd_del_replicated_table;
+	int			upd_del_replicated_table;
 	bool		is_split_update;	/* true if UPDATE that modifies
 									 * distribution key columns */
+	bool		is_correlated_subplan; /* true for correlated subqueries nested within subplans */
 } PlannerInfo;
 
 /*
@@ -846,6 +846,9 @@ typedef struct DistributionKey
 	NodeTag		type;
 
 	List	   *dk_eclasses;	/* the value that is distributed */
+
+	/* Hash operator family that determines the hash function to use */
+	Oid			dk_opfamily;
 } DistributionKey;
 
 /*
@@ -1215,6 +1218,14 @@ typedef struct MaterialPath
                                  *            before yielding output tuples
                                  * false => memoize tuples as they stream thru
                                  */
+
+	/*
+	 * If 'cdb_shield_child_from_rescans' is set, the sub-plan is not
+	 * rescannable, and the Material never call rescan on it. (The Material
+	 * node will keep all tuples, even if REWIND/BACKWARD/MARK executor flags
+	 * are not set.)
+	 */
+	bool		cdb_shield_child_from_rescans;
 } MaterialPath;
 
 /*

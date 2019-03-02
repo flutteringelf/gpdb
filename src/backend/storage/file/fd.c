@@ -172,6 +172,7 @@ int			max_safe_fds = 32;	/* default if not changed */
 /* these are the assigned bits in fdstate below: */
 #define FD_TEMPORARY		(1 << 0)	/* T = delete when closed */
 #define FD_XACT_TEMPORARY	(1 << 1)	/* T = delete at eoXact */
+#define FD_WORKFILE			(1 << 2)	/* tracked by workfile manager */
 
 typedef struct vfd
 {
@@ -312,7 +313,8 @@ static int	FreeDesc(AllocateDesc *desc);
 
 static void AtProcExit_Files(int code, Datum arg);
 static void CleanupTempFiles(bool isProcExit);
-static void RemovePgTempFilesInDir(const char *tmpdirname);
+static void RemovePgTempFilesInDir(const char *tmpdirname, bool missing_ok,
+					   bool unlink_all);
 static void RemovePgTempRelationFiles(const char *tsdirname);
 static void RemovePgTempRelationFilesInDbspace(const char *dbspacedirname);
 static bool looks_like_temp_rel_name(const char *name);
@@ -1557,6 +1559,9 @@ FileClose(File file)
 		else
 			stat_errno = 0;
 
+		if (vfdP->fdstate & FD_WORKFILE)
+			WorkFileDeleted(file);
+
 		/* in any case do the unlink */
 		if (unlink(vfdP->fileName))
 			elog(LOG, "could not unlink file \"%s\": %m", vfdP->fileName);
@@ -1745,6 +1750,23 @@ FileWrite(File file, char *buffer, int amount)
 				 errmsg("temporary file size exceeds temp_file_limit (%dkB)",
 						temp_file_limit)));
 		}
+	}
+
+	/*
+	 * Also update the stats in workfile manager. This might also
+	 * throw an error, if we're over the limits.
+	 *
+	 * Because we update the stats in workfile manager first, if the write
+	 * fails, the workfile manager's status will be out of sync with reality.
+	 * That's OK, the inaccuracy doens't accumulate, and it doesn't need to be
+	 * totallyaccurate.
+	 */
+	if ((VfdCache[file].fdstate & FD_WORKFILE) != 0)
+	{
+		off_t		newPos = VfdCache[file].seekPos + amount;
+
+		if (newPos > VfdCache[file].fileSize)
+			UpdateWorkFileSize(file, newPos);
 	}
 
 retry:
@@ -2709,8 +2731,6 @@ CleanupTempFiles(bool isProcExit)
 		have_xact_temporary_files = false;
 	}
 
-	workfile_mgr_cleanup();
-
 	/* Clean up "allocated" stdio files, dirs and fds. */
 	while (numAllocatedDescs > 0)
 		FreeDesc(&allocatedDescs[0]);
@@ -2742,7 +2762,7 @@ RemovePgTempFiles(void)
 	 * First process temp files in pg_default ($PGDATA/base)
 	 */
 	snprintf(temp_path, sizeof(temp_path), "base/%s", PG_TEMP_FILES_DIR);
-	RemovePgTempFilesInDir(temp_path);
+	RemovePgTempFilesInDir(temp_path, true, false);
 	RemovePgTempRelationFiles("base");
 
 	/*
@@ -2758,7 +2778,7 @@ RemovePgTempFiles(void)
 
 		snprintf(temp_path, sizeof(temp_path), "pg_tblspc/%s/%s/%s",
 				 spc_de->d_name, tablespace_version_directory(), PG_TEMP_FILES_DIR);
-		RemovePgTempFilesInDir(temp_path);
+		RemovePgTempFilesInDir(temp_path, true, false);
 
 		snprintf(temp_path, sizeof(temp_path), "pg_tblspc/%s/%s",
 				 spc_de->d_name, tablespace_version_directory());
@@ -2772,30 +2792,38 @@ RemovePgTempFiles(void)
 	 * DataDir as well.
 	 */
 #ifdef EXEC_BACKEND
-	RemovePgTempFilesInDir(PG_TEMP_FILES_DIR);
+	RemovePgTempFilesInDir(PG_TEMP_FILES_DIR, true, false);
 #endif
 }
 
-/* Process one pgsql_tmp directory for RemovePgTempFiles */
+/*
+ * Process one pgsql_tmp directory for RemovePgTempFiles.
+ *
+ * If missing_ok is true, it's all right for the named directory to not exist.
+ * Any other problem results in a LOG message.  (missing_ok should be true at
+ * the top level, since pgsql_tmp directories are not created until needed.)
+ *
+ * At the top level, this should be called with unlink_all = false, so that
+ * only files matching the temporary name prefix will be unlinked.  When
+ * recursing it will be called with unlink_all = true to unlink everything
+ * under a top-level temporary directory.
+ *
+ * (These two flags could be replaced by one, but it seems clearer to keep
+ * them separate.)
+ */
 static void
-RemovePgTempFilesInDir(const char *tmpdirname)
+RemovePgTempFilesInDir(const char *tmpdirname, bool missing_ok, bool unlink_all)
 {
 	DIR		   *temp_dir;
 	struct dirent *temp_de;
 	char		rm_path[MAXPGPATH * 2];
 
 	temp_dir = AllocateDir(tmpdirname);
-	if (temp_dir == NULL)
-	{
-		/* anything except ENOENT is fishy */
-		if (errno != ENOENT)
-			elog(LOG,
-				 "could not open temporary-files directory \"%s\": %m",
-				 tmpdirname);
-		return;
-	}
 
-	while ((temp_de = ReadDir(temp_dir, tmpdirname)) != NULL)
+	if (temp_dir == NULL && errno == ENOENT && missing_ok)
+		return;
+
+	while ((temp_de = ReadDirExtended(temp_dir, tmpdirname, LOG)) != NULL)
 	{
 		if (strcmp(temp_de->d_name, ".") == 0 ||
 			strcmp(temp_de->d_name, "..") == 0)
@@ -2804,23 +2832,45 @@ RemovePgTempFilesInDir(const char *tmpdirname)
 		snprintf(rm_path, sizeof(rm_path), "%s/%s",
 				 tmpdirname, temp_de->d_name);
 
-		if (strncmp(temp_de->d_name,
+		if (unlink_all ||
+			strncmp(temp_de->d_name,
 					PG_TEMP_FILE_PREFIX,
 					strlen(PG_TEMP_FILE_PREFIX)) == 0)
 		{
-			/*
-			 * It can be a file or a directory, so try to delete both ways
-			 * We ignore errors.
-			 */
-			unlink(rm_path);
-			rmtree(rm_path, true);
+			struct stat statbuf;
+
+			if (lstat(rm_path, &statbuf) < 0)
+			{
+				ereport(LOG,
+						(errcode_for_file_access(),
+						 errmsg("could not stat file \"%s\": %m", rm_path)));
+				continue;
+			}
+
+			if (S_ISDIR(statbuf.st_mode))
+			{
+				/* recursively remove contents, then directory itself */
+				RemovePgTempFilesInDir(rm_path, false, true);
+
+				if (rmdir(rm_path) < 0)
+					ereport(LOG,
+							(errcode_for_file_access(),
+							 errmsg("could not remove directory \"%s\": %m",
+									rm_path)));
+			}
+			else
+			{
+				if (unlink(rm_path) < 0)
+					ereport(LOG,
+							(errcode_for_file_access(),
+							 errmsg("could not remove file \"%s\": %m",
+									rm_path)));
+			}
 		}
 		else
-		{
-			elog(LOG,
-				 "unexpected file found in temporary-files directory: \"%s\"",
-				 rm_path);
-		}
+			ereport(LOG,
+					(errmsg("unexpected file found in temporary-files directory: \"%s\"",
+							rm_path)));
 	}
 
 	FreeDir(temp_dir);
@@ -3255,4 +3305,27 @@ fsync_parent_path(const char *fname, int elevel)
 		return -1;
 
 	return 0;
+}
+
+const char *
+FileGetFilename(File file)
+{
+
+	Assert(FileIsValid(file));
+
+	DO_DB(elog(LOG, "FileSeek: %d (%s) " INT64_FORMAT " " INT64_FORMAT " %d",
+			   file, VfdCache[file].fileName,
+			   (int64) VfdCache[file].seekPos,
+			   (int64) offset, whence));
+
+	return VfdCache[file].fileName;
+}
+
+/*
+ * Mark the file as a "work file" that should be tracked by the workfile manager.
+ */
+void
+FileSetIsWorkfile(File file)
+{
+	VfdCache[file].fdstate |= FD_WORKFILE;
 }

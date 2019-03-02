@@ -31,6 +31,7 @@
 #include "utils/selfuncs.h"
 
 #include "catalog/pg_proc.h"
+#include "cdb/cdbhash.h"        /* cdb_default_distribution_opfamily_for_type() */
 #include "cdb/cdbpath.h"        /* cdb_create_motion_path() etc */
 #include "cdb/cdbutil.h"		/* getgpsegmentCount() */
 #include "executor/nodeHash.h"
@@ -1358,12 +1359,12 @@ set_append_path_locus(PlannerInfo *root, Path *pathnode, RelOptInfo *rel,
 	{
 		/* FIXME: do not hard code to ALL */
 		CdbPathLocus_MakeGeneral(&pathnode->locus,
-								 GP_POLICY_ALL_NUMSEGMENTS);
+								 getgpsegmentCount());
 		return;
 	}
 
 	/* By default put Append node on all the segments */
-	numsegments = GP_POLICY_ALL_NUMSEGMENTS;
+	numsegments = getgpsegmentCount();
 	foreach(l, subpaths)
 	{
 		Path	   *subpath = (Path *) lfirst(l);
@@ -1537,7 +1538,7 @@ create_result_path(List *quals)
 	pathnode->path.total_cost = cpu_tuple_cost;
 
 	/* Result can be on any segments */
-	CdbPathLocus_MakeGeneral(&pathnode->path.locus, GP_POLICY_ALL_NUMSEGMENTS);
+	CdbPathLocus_MakeGeneral(&pathnode->path.locus, getgpsegmentCount());
 	pathnode->path.motionHazard = false;
 	pathnode->path.rescannable = true;
 
@@ -1781,7 +1782,19 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	{
 		int			numsegments = CdbPathLocus_NumSegments(subpath->locus);
 
-        locus = cdbpathlocus_from_exprs(root, uniq_exprs, numsegments);
+		List	   *opfamilies = NIL;
+		ListCell   *lc;
+
+		foreach(lc, uniq_exprs)
+		{
+			Node	   *expr = lfirst(lc);
+			Oid			opfamily;
+
+			opfamily = cdb_default_distribution_opfamily_for_type(exprType(expr));
+			opfamilies = lappend_oid(opfamilies, opfamily);
+		}
+
+		locus = cdbpathlocus_from_exprs(root, uniq_exprs, opfamilies, numsegments);
         subpath = cdbpath_create_motion_path(root, subpath, NIL, false, locus);
 		/*
 		 * We probably add agg/sort node above the added motion node, but it is
@@ -2451,56 +2464,41 @@ distinct_col_search(int colno, List *colnos, List *opids)
 }
 
 static bool
-subquery_motionHazard_walker(Plan *node, void *context)
+subquery_motionHazard_walker(Plan *node)
 {
+	List       *planlist = NIL;
+
 	if (node == NULL)
 		return false;
 
 	if (IsA(node, Motion))
 		return true;
+	else if (IsA(node, SubqueryScan))
+		return subquery_motionHazard_walker(((SubqueryScan *) node)->subplan);
 	else if (IsA(node, Append))
-	{
-		ListCell   *l;
-
-		foreach(l, ((Append *) node)->appendplans)
-		{
-			if (subquery_motionHazard_walker((Plan *) lfirst(l), NULL))
-				return true;
-		}
-	}
+		planlist = ((Append *) node)->appendplans;
 	else if (IsA(node, MergeAppend))
-	{
-		ListCell   *l;
-
-		foreach(l, ((MergeAppend *) node)->mergeplans)
-		{
-			if (subquery_motionHazard_walker((Plan *) lfirst(l), NULL))
-				return true;
-		}
-	}
+		planlist = ((MergeAppend *) node)->mergeplans;
 	else if (IsA(node, BitmapAnd))
-	{
-		ListCell   *l;
-
-		foreach(l, ((BitmapAnd *) node)->bitmapplans)
-		{
-			if (subquery_motionHazard_walker((Plan *) lfirst(l), NULL))
-				return true;
-		}
-	}
+		planlist = ((BitmapAnd *) node)->bitmapplans;
 	else if (IsA(node, BitmapOr))
-	{
-		ListCell   *l;
+		planlist = ((BitmapOr *) node)->bitmapplans;
+	else if (IsA(node, Sequence))
+		planlist = ((Sequence *) node)->subplans;
+	else if (IsA(node, ModifyTable))
+		planlist = ((ModifyTable *) node)->plans;
 
-		foreach(l, ((BitmapOr *) node)->bitmapplans)
-		{
-			if (subquery_motionHazard_walker((Plan *) lfirst(l), NULL))
-				return true;
-		}
+	/* Handle plan lists */
+	ListCell   *l;
+	foreach(l, planlist)
+	{
+		if (subquery_motionHazard_walker((Plan *) lfirst(l)))
+			return true;
 	}
 
-	if (subquery_motionHazard_walker(node->lefttree, NULL) ||
-		subquery_motionHazard_walker(node->righttree, NULL))
+	/* left tree and right tree */
+	if (subquery_motionHazard_walker(node->lefttree) ||
+		subquery_motionHazard_walker(node->righttree))
 		return true;
 
 	return false;
@@ -2524,7 +2522,7 @@ create_subqueryscan_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->pathkeys = pathkeys;
 
 	pathnode->locus = cdbpathlocus_from_subquery(root, rel->subplan, rel->relid);
-	pathnode->motionHazard = subquery_motionHazard_walker(rel->subplan, NULL);
+	pathnode->motionHazard = subquery_motionHazard_walker(rel->subplan);
 	pathnode->rescannable = false;
 	pathnode->sameslice_relids = NULL;
 
@@ -2639,14 +2637,14 @@ create_functionscan_path(PlannerInfo *root, RelOptInfo *rel,
 				CdbPathLocus_MakeEntry(&pathnode->locus);
 			else
 				CdbPathLocus_MakeGeneral(&pathnode->locus,
-										 GP_POLICY_ALL_NUMSEGMENTS);
+										 getgpsegmentCount());
 			break;
 		case PROEXECLOCATION_MASTER:
 			CdbPathLocus_MakeEntry(&pathnode->locus);
 			break;
 		case PROEXECLOCATION_ALL_SEGMENTS:
 			CdbPathLocus_MakeStrewn(&pathnode->locus,
-									GP_POLICY_ALL_NUMSEGMENTS);
+									getgpsegmentCount());
 			break;
 		default:
 			elog(ERROR, "unrecognized proexeclocation '%c'", exec_location);
@@ -2740,7 +2738,7 @@ create_valuesscan_path(PlannerInfo *root, RelOptInfo *rel,
 		/*
 		 * ValuesScan can be on any segment.
 		 */
-		CdbPathLocus_MakeGeneral(&pathnode->locus, GP_POLICY_ALL_NUMSEGMENTS);
+		CdbPathLocus_MakeGeneral(&pathnode->locus, getgpsegmentCount());
 
 	pathnode->motionHazard = false;
 	pathnode->rescannable = true;
@@ -2800,7 +2798,7 @@ create_worktablescan_path(PlannerInfo *root, RelOptInfo *rel,
 	if (rel->cdbpolicy)
 		numsegments = rel->cdbpolicy->numsegments;
 	else
-		numsegments = GP_POLICY_ALL_NUMSEGMENTS; /* FIXME */
+		numsegments = getgpsegmentCount(); /* FIXME */
 
 	if (ctelocus == CdbLocusType_Entry)
 		CdbPathLocus_MakeEntry(&result);
@@ -2893,10 +2891,10 @@ create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
 	switch (rel->ftEntry->exec_location)
 	{
 		case FTEXECLOCATION_ANY:
-			CdbPathLocus_MakeGeneral(&(pathnode->path.locus), GP_POLICY_ALL_NUMSEGMENTS);
+			CdbPathLocus_MakeGeneral(&(pathnode->path.locus), getgpsegmentCount());
 			break;
 		case FTEXECLOCATION_ALL_SEGMENTS:
-			CdbPathLocus_MakeStrewn(&(pathnode->path.locus), GP_POLICY_ALL_NUMSEGMENTS);
+			CdbPathLocus_MakeStrewn(&(pathnode->path.locus), getgpsegmentCount());
 			break;
 		case FTEXECLOCATION_MASTER:
 			CdbPathLocus_MakeEntry(&(pathnode->path.locus));
@@ -2998,22 +2996,10 @@ create_nestloop_path(PlannerInfo *root,
 {
 	NestPath   *pathnode;
 	CdbPathLocus join_locus;
-	bool		inner_must_be_local = false;
+	Relids		outer_req_outer = PATH_REQ_OUTER(outer_path);
+	bool		outer_must_be_local = !bms_is_empty(outer_req_outer);
 	Relids		inner_req_outer = PATH_REQ_OUTER(inner_path);
-
-	/*
-	 * CDB: Inner indexpath must execute in the same backend as the
-	 * nested join to receive input values from the outer rel.
-	 */
-	inner_must_be_local = path_contains_inner_index(inner_path);
-
-	/*
-	 * If the inner path is parameterized by the outer, we can't insert
-	 * a Motion node in between, because the parameter cannot be transferred
-	 * through the Motion
-	 */
-	if (bms_overlap(inner_req_outer, outer_path->parent->relids))
-		inner_must_be_local = true;
+	bool		inner_must_be_local = !bms_is_empty(inner_req_outer);
 
 	/* Add motion nodes above subpaths and decide where to join. */
 	join_locus = cdbpath_motion_for_join(root,
@@ -3023,7 +3009,7 @@ create_nestloop_path(PlannerInfo *root,
 										 redistribution_clauses,
 										 pathkeys,
 										 NIL,
-										 false,
+										 outer_must_be_local,
 										 inner_must_be_local);
 	if (CdbPathLocus_IsNull(join_locus))
 		return NULL;
@@ -3033,32 +3019,47 @@ create_nestloop_path(PlannerInfo *root,
 		pathkeys = NIL;
 
 	/*
+	 * If this join path is parameterized by a parameter above this path, then
+	 * this path needs to be rescannable. A NestLoop is rescannable, when both
+	 * outer and inner paths rescannable, so make them both rescannable.
+	 */
+	if (!outer_path->rescannable && !bms_is_empty(required_outer))
+	{
+		MaterialPath *matouter = create_material_path(root, outer_path->parent, outer_path);
+
+		matouter->cdb_shield_child_from_rescans = true;
+
+		outer_path = (Path *) matouter;
+	}
+
+	/*
 	 * If outer has at most one row, NJ will make at most one pass over inner.
 	 * Else materialize inner rel after motion so NJ can loop over results.
-	 * Skip if an intervening Unique operator will materialize.
 	 */
-	if (!outer_path->parent->onerow)
+	if (!inner_path->rescannable &&
+		(!outer_path->parent->onerow || !bms_is_empty(required_outer)))
 	{
-		if (!inner_path->rescannable)
-		{
-			/*
-			 * NLs potentially rescan the inner; if our inner path
-			 * isn't rescannable we have to add a materialize node
-			 */
-			inner_path = (Path *)create_material_path(root, inner_path->parent, inner_path);
+		/*
+		 * NLs potentially rescan the inner; if our inner path
+		 * isn't rescannable we have to add a materialize node
+		 */
+		MaterialPath *matinner = create_material_path(root, inner_path->parent, inner_path);
 
-			/*
-			 * If we have motion on the outer, to avoid a deadlock; we
-			 * need to set cdb_strict. In order for materialize to
-			 * fully fetch the underlying (required to avoid our
-			 * deadlock hazard) we must set cdb_strict!
-			 */
-			if (inner_path->motionHazard && outer_path->motionHazard)
-			{
-				((MaterialPath *) inner_path)->cdb_strict = true;
-				inner_path->motionHazard = false;
-			}
+		matinner->cdb_shield_child_from_rescans = true;
+
+		/*
+		 * If we have motion on the outer, to avoid a deadlock; we
+		 * need to set cdb_strict. In order for materialize to
+		 * fully fetch the underlying (required to avoid our
+		 * deadlock hazard) we must set cdb_strict!
+		 */
+		if (inner_path->motionHazard && outer_path->motionHazard)
+		{
+			matinner->cdb_strict = true;
+			matinner->path.motionHazard = false;
 		}
+
+		inner_path = (Path *) matinner;
 	}
 
 	/*
@@ -3212,6 +3213,9 @@ create_mergejoin_path(PlannerInfo *root,
 	else
 		preserve_outer_ordering = preserve_inner_ordering = false;
 
+	preserve_outer_ordering = preserve_outer_ordering || !bms_is_empty(PATH_REQ_OUTER(outer_path));
+	preserve_inner_ordering = preserve_inner_ordering || !bms_is_empty(PATH_REQ_OUTER(inner_path));
+
 	join_locus = cdbpath_motion_for_join(root,
 										 jointype,
 										 &outer_path,       /* INOUT */
@@ -3308,6 +3312,8 @@ create_hashjoin_path(PlannerInfo *root,
 {
 	HashPath   *pathnode;
 	CdbPathLocus join_locus;
+	bool		outer_must_be_local = !bms_is_empty(PATH_REQ_OUTER(outer_path));
+	bool		inner_must_be_local = !bms_is_empty(PATH_REQ_OUTER(inner_path));
 
 	/* Add motion nodes above subpaths and decide where to join. */
 	join_locus = cdbpath_motion_for_join(root,
@@ -3317,8 +3323,8 @@ create_hashjoin_path(PlannerInfo *root,
 										 redistribution_clauses,
 										 NIL,   /* don't care about ordering */
 										 NIL,
-										 false,
-										 false);
+										 outer_must_be_local,
+										 inner_must_be_local);
 	if (CdbPathLocus_IsNull(join_locus))
 		return NULL;
 

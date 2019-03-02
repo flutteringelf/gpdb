@@ -19,7 +19,9 @@ select rsgname
      , cpu
      , memory_used
      , memory_shared_used
-  from gp_toolkit.gp_resgroup_status_per_host
+  from gp_toolkit.gp_resgroup_status_per_host s
+  join gp_segment_configuration c
+    on s.hostname=c.hostname and c.content=-1
  where rsgname='default_group';
 
 select rsgname
@@ -30,7 +32,7 @@ select rsgname
      , memory_shared_used
   from gp_toolkit.gp_resgroup_status_per_segment
  where rsgname='default_group'
- order by segment_id;
+   and segment_id=-1;
 
 -- also log the raw output of the views, if any of above tests failed it is
 -- easier to find out the causes with these logs.

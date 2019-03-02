@@ -16,6 +16,7 @@
 
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
+#include "cdb/cdbvars.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/analyze.h"
 #include "parser/parse_cte.h"
@@ -113,6 +114,16 @@ transformWithClause(ParseState *pstate, WithClause *withClause)
 	Assert(pstate->p_future_ctes == NIL);
 
 	/*
+	 * WITH RECURSIVE is disabled if gp_recursive_cte_prototype is not set
+	 * to allow recursive CTEs.
+	 */
+	if (withClause->recursive && !gp_recursive_cte_prototype)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("RECURSIVE clauses in WITH queries are currently disabled"),
+				 errhint("In order to use recursive CTEs, \"gp_recursive_cte_prototype\" must be turned on.")));
+
+	/*
 	 * For either type of WITH, there must not be duplicate CTE names in the
 	 * list.  Check this right away so we needn't worry later.
 	 *
@@ -145,6 +156,19 @@ transformWithClause(ParseState *pstate, WithClause *withClause)
 			Assert(IsA(cte->ctequery, InsertStmt) ||
 				   IsA(cte->ctequery, UpdateStmt) ||
 				   IsA(cte->ctequery, DeleteStmt));
+
+
+			/*
+			 * Since GPDB currently only support a single writer gang, only one
+			 * writable clause is permitted per CTE. Once we get flexible gangs
+			 * with more than one writer gang we can lift this restriction.
+			 */
+			if (pstate->p_hasModifyingCTE)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("only one modifying WITH clause allowed per query"),
+						 errdetail("Greenplum Database currently only support CTEs with one writable clause."),
+						 errhint("Rewrite the query to only include one writable CTE clause.")));
 
 			pstate->p_hasModifyingCTE = true;
 		}
