@@ -14,7 +14,7 @@ compare_bin_gpdb_version_with_gpdb_src() {
 
   # Get gpdb commit SHA
   source "${GREENPLUM_INSTALL_DIR}/greenplum_path.sh"
-  bin_gpdb_version=$(postgres --gp-version | sed 's/.*build commit:\(.*\)-oss/\1/')
+  bin_gpdb_version=$(postgres --gp-version | sed 's/.*build commit:\(.*\)/\1/')
 
   if [ "${bin_gpdb_version}" != "${GPDB_SRC_VERSION}" ]; then
     echo "bin_gpdb version: ${bin_gpdb_version} does not match gpdb_src version: ${GPDB_SRC_VERSION}, please wait for the next build. Exiting..."
@@ -31,7 +31,7 @@ pushd gpdb_src
   GPDB_SRC_VERSION=$(git rev-parse HEAD)
 popd
 
-for bin_gpdb in bin_gpdb_* ; do
+for bin_gpdb in bin_gpdb_centos{6,7} ; do
   compare_bin_gpdb_version_with_gpdb_src "${bin_gpdb}"
 done
 

@@ -52,8 +52,7 @@ cdbpath_cost_motion(PlannerInfo *root, CdbMotionPath *motionpath)
 	double		sendrows;
 
 	if (CdbPathLocus_IsReplicated(motionpath->path.locus))
-		/* FIXME: should use other.numsegments instead of cdbpath_segments */
-		motionpath->path.rows = subpath->rows * root->config->cdbpath_segments;
+		motionpath->path.rows = subpath->rows * CdbPathLocus_NumSegments(motionpath->path.locus);
 	else
 		motionpath->path.rows = subpath->rows;
 
@@ -111,7 +110,6 @@ cdbpath_create_motion_path(PlannerInfo *root,
 		if (CdbPathLocus_IsEntry(subpath->locus) &&
 			CdbPathLocus_IsEntry(locus))
 		{
-			/* FIXME: how to reach here? what's the proper value for numsegments? */
 			subpath->locus.numsegments = getgpsegmentCount();
 			return subpath;
 		}
@@ -197,11 +195,10 @@ cdbpath_create_motion_path(PlannerInfo *root,
 		/* No motion needed if subpath can run anywhere giving same output. */
 		if (CdbPathLocus_IsGeneral(subpath->locus))
 		{
-			if (CdbPathLocus_NumSegments(subpath->locus) <
-				CdbPathLocus_NumSegments(locus))
-			{
-				/* FIXME: is a motion needed? */
-			}
+			/*
+			 * general-->(entry|singleqe), no motion is needed, can run
+			 * directly on any of the common segments
+			 */
 			subpath->locus.numsegments = numsegments;
 			return subpath;
 		}
@@ -908,8 +905,6 @@ cdbpath_motion_for_join(PlannerInfo *root,
 	outer.has_wts = cdbpath_contains_wts(outer.path);
 	inner.has_wts = cdbpath_contains_wts(inner.path);
 
-	/* FIXME: special optimization for numsegments=1 */
-
 	/* For now, inner path should not contain WorkTableScan */
 	Assert(!inner.has_wts);
 
@@ -1091,13 +1086,8 @@ cdbpath_motion_for_join(PlannerInfo *root,
 					   CdbPathLocus_NumSegments(other->locus));
 
 				/*
-				 * FIXME: if "replicate table" in below comments means the
-				 * DISTRIBUTED REPLICATED table then maybe the logic should
-				 * not be put here.
-				 */
-				/*
-				 * execute the plan in the segment which replicate table is
-				 * storaged.
+				 * Only need to broadcast other to the segments of the
+				 * replicated table.
 				 */
 				if (CdbPathLocus_NumSegments(segGeneral->locus) <
 					CdbPathLocus_NumSegments(other->locus))
@@ -1185,11 +1175,6 @@ cdbpath_motion_for_join(PlannerInfo *root,
 												   other->locus,
 												   &segGeneral->move_to))    /* OUT */
 				{
-					/*
-					 * XXX: if we require replicated tables to be reshuffled
-					 * before any other tables, then we could avoid such a case
-					 */
-
 					/* the result is distributed on the same segments with other */
 					AssertEquivalent(CdbPathLocus_NumSegments(other->locus),
 									 CdbPathLocus_NumSegments(segGeneral->move_to));

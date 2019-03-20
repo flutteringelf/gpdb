@@ -75,6 +75,8 @@ static int	CdbComponentDatabaseInfoCompare(const void *p1, const void *p2);
 static void getAddressesForDBid(CdbComponentDatabaseInfo *c, int elevel);
 static HTAB *hostSegsHashTableInit(void);
 
+static int nextQEIdentifer(CdbComponentDatabases *cdbs);
+
 static HTAB *segment_ip_cache_htab = NULL;
 
 int numsegmentsFromQD = -1;
@@ -159,6 +161,7 @@ getCdbComponentInfo(bool DNSLookupAsError)
 	component_databases->numActiveQEs = 0;
 	component_databases->numIdleQEs = 0;
 	component_databases->qeCounter = 0;
+	component_databases->freeCounterList = NIL;
 
 	component_databases->segment_db_info =
 		(CdbComponentDatabaseInfo *) palloc0(sizeof(CdbComponentDatabaseInfo) * segment_array_size);
@@ -338,13 +341,13 @@ getCdbComponentInfo(bool DNSLookupAsError)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_CARDINALITY_VIOLATION),
-				 errmsg("Greenplum Database number of segment databases cannot be 0")));
+				 errmsg("number of segment databases cannot be 0")));
 	}
 	if (component_databases->total_entry_dbs == 0)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_CARDINALITY_VIOLATION),
-				 errmsg("Greenplum Database number of entry databases cannot be 0")));
+				 errmsg("number of entry databases cannot be 0")));
 	}
 
 	/*
@@ -387,8 +390,9 @@ getCdbComponentInfo(bool DNSLookupAsError)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_EXCEPTION),
-				 errmsg("Cannot locate entry database represented by this db in gp_segment_configuration: dbid %d content %d",
-						GpIdentity.dbid, GpIdentity.segindex)));
+				 errmsg("cannot locate entry database"),
+				 errdetail("Entry database represented by this db in gp_segment_configuration: dbid %d content %d",
+						   GpIdentity.dbid, GpIdentity.segindex)));
 	}
 
 	/*
@@ -412,16 +416,20 @@ getCdbComponentInfo(bool DNSLookupAsError)
 			{
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_EXCEPTION),
-						 errmsg("Content values not valid in %s table.  They must be in the range 0 to %d inclusive",
-								GpSegmentConfigRelationName, component_databases->total_segments - 1)));
+						 errmsg("content values not valid in %s table",
+								GpSegmentConfigRelationName),
+						 errdetail("Content values must be in the range 0 to %d inclusive.",
+								   component_databases->total_segments - 1)));
 			}
 		}
 		if (this_segindex != i)
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_EXCEPTION),
-					 errmsg("Content values not valid in %s table.  They must be in the range 0 to %d inclusive",
-							GpSegmentConfigRelationName, component_databases->total_segments - 1)));
+					 errmsg("content values not valid in %s table",
+							GpSegmentConfigRelationName),
+					 errdetail("Content values must be in the range 0 to %d inclusive",
+							   component_databases->total_segments - 1)));
 		}
 	}
 
@@ -693,7 +701,7 @@ cdbcomponent_allocateIdleQE(int contentId, SegmentType segmentType)
 		 * 2. for first QE, it must be a writer.
 		 */
 		isWriter = contentId == -1 ? false: (cdbinfo->numIdleQEs == 0 && cdbinfo->numActiveQEs == 0);
-		segdbDesc = cdbconn_createSegmentDescriptor(cdbinfo, cdbinfo->cdbs->qeCounter++, isWriter);
+		segdbDesc = cdbconn_createSegmentDescriptor(cdbinfo, nextQEIdentifer(cdbinfo->cdbs), isWriter);
 	}
 
 	cdbconn_setQEIdentifier(segdbDesc, -1);
@@ -803,6 +811,19 @@ destroy_segdb:
 	MemoryContextSwitchTo(oldContext);
 }
 
+static int
+nextQEIdentifer(CdbComponentDatabases *cdbs)
+{
+	int result;
+
+	if (!cdbs->freeCounterList)
+		return cdbs->qeCounter++;
+
+	result = linitial_int(cdbs->freeCounterList);
+	cdbs->freeCounterList = list_delete_first(cdbs->freeCounterList);
+	return result;
+}
+
 bool
 cdbcomponent_qesExist(void)
 {
@@ -828,9 +849,10 @@ cdbcomponent_getComponentInfo(int contentId)
 	cdbs = cdbcomponent_getCdbComponents(true);
 
 	if (contentId < -1 || contentId >= cdbs->total_segments)
-		ereport(FATAL, (errcode(ERRCODE_DATA_EXCEPTION),
-						 errmsg("Unexpected content id %d, should be [-1, %d]",
-								contentId, cdbs->total_segments - 1)));
+		ereport(FATAL,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("unexpected content id %d, should be [-1, %d]",
+						contentId, cdbs->total_segments - 1)));
 	/* entry db */
 	if (contentId == -1)
 	{
@@ -1139,7 +1161,8 @@ getAddressesForDBid(CdbComponentDatabaseInfo *c, int elevel)
 	memset(c->hostaddrs, 0, COMPONENT_DBS_MAX_ADDRS * sizeof(char *));
 
 #ifdef FAULT_INJECTOR
-	if (SIMPLE_FAULT_INJECTOR(GetDnsCachedAddress) == FaultInjectorTypeSkip)
+	if (am_ftsprobe &&
+		SIMPLE_FAULT_INJECTOR(GetDnsCachedAddress) == FaultInjectorTypeSkip)
 	{
 		/* inject a dns error for primary of segment 0 */
 		if (c->segindex == 0 &&
