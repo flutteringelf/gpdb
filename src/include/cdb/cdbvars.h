@@ -744,7 +744,7 @@ extern bool gp_dynamic_partition_pruning;
 /* Sharing of plan fragments for common table expressions */
 extern bool gp_cte_sharing;
 /* Enable RECURSIVE clauses in common table expressions */
-extern bool gp_recursive_cte_prototype;
+extern bool gp_recursive_cte;
 
 /* Priority for the segworkers relative to the postmaster's priority */
 extern int gp_segworker_relative_priority;
@@ -765,11 +765,6 @@ extern bool 	gp_statistics_pullup_from_child_partition;
 
 /* Extract numdistinct from foreign key relationship */
 extern bool		gp_statistics_use_fkeys;
-
-/* Analyze related gucs */
-extern int 		gp_statistics_blocks_target;
-extern double	gp_statistics_ndistinct_scaling_ratio_threshold;
-extern double	gp_statistics_sampling_threshold;
 
 /* Analyze tools */
 extern int gp_motion_slice_noop;

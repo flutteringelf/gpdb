@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE map PUBLIC "-//OASIS//DTD DITA Map//EN" "map.dtd">
 <map>
-	<topicref href="../../600/homenav.html" scope="external" navtitle="Greenplum Database® 6.0 Documentation"
+	<topicref href="../../6-0/homenav.html" scope="external" navtitle="Greenplum Database® 6.0 Documentation"
 		format="html" otherprops="oss-only"/>
-	<topicref href="../../600/homenav.html" scope="external" navtitle="Pivotal Greenplum® 6.0 Documentation"
+	<topicref href="../../6-0/homenav.html" scope="external" navtitle="Pivotal Greenplum® 6.0 Documentation"
 		format="html" otherprops="pivotal"/>
 	<topicref href="ref_guide.xml" navtitle="Reference Guide">
 		<topicref href="sql_commands/sql_ref.xml">
@@ -33,6 +33,7 @@
 			<topicref href="sql_commands/ALTER_SCHEMA.xml"/>
 			<topicref href="sql_commands/ALTER_SEQUENCE.xml"/>
 			<topicref href="sql_commands/ALTER_SERVER.xml"/>
+      <topicref href="sql_commands/ALTER_SYSTEM.xml"/>
 			<topicref href="sql_commands/ALTER_TABLE.xml"/>
 			<topicref href="sql_commands/ALTER_TABLESPACE.xml"/>
 			<topicref href="sql_commands/ALTER_TEXT_SEARCH_CONFIGURATION.xml"/>
@@ -152,6 +153,7 @@
 			<topicref href="sql_commands/SELECT.xml"/>
 			<topicref href="sql_commands/SELECT_INTO.xml"/>
 			<topicref href="sql_commands/SET.xml"/>
+			<topicref href="sql_commands/SET_CONSTRAINTS.xml"/>
 			<topicref href="sql_commands/SET_ROLE.xml"/>
 			<topicref href="sql_commands/SET_SESSION_AUTHORIZATION.xml"/>
 			<topicref href="sql_commands/SET_TRANSACTION.xml"/>
@@ -297,6 +299,7 @@
 		<topicref href="extensions/gppc.xml" navtitle="Greenplum Partner Connector API" id="gppc"/>
 		<topicref href="extensions/fuzzystrmatch.xml"
 			navtitle="Greenplum Fuzzy String Match Extension" id="fuzzystrmatch"/>
+		<topicref href="extensions/bgworker.xml"/>
 		<topicref href="feature_summary.xml" navtitle="Summary of Greenplum Features"
 			id="feature_summary"/>
 	</topicref>

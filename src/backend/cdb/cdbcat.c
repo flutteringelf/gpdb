@@ -38,6 +38,7 @@
 #include "utils/memutils.h"
 #include "utils/tqual.h"
 #include "utils/syscache.h"
+#include "utils/lsyscache.h"
 
 /*
  * The default numsegments when creating tables.  The value can be an integer
@@ -329,6 +330,28 @@ GpPolicyFetch(Oid tbloid)
 		int			nattrs;
 		int2vector *distkey;
 		oidvector  *distopclasses;
+
+		/*
+		 * Sanity check of numsegments.
+		 *
+		 * Currently, Gxact always use a fixed size of cluster after the Gxact started,
+		 * If a table is expanded after Gxact started, we should report an error,
+		 * otherwise, planner will arrange a gang whose size is larger than the size
+		 * of cluster and dispatcher cannot handle this.
+		 */
+		if ((Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_EXECUTE) &&
+			policyform->numsegments > getgpsegmentCount())
+		{
+			ReleaseSysCache(gp_policy_tuple);
+			ereport(ERROR,
+					(errcode(ERRCODE_GP_FEATURE_NOT_YET),
+					 errmsg("cannot access table \"%s\" in current transaction",
+							get_rel_name(tbloid)),
+					 errdetail("New segments are concurrently added to the cluster during the execution of current transaction, "
+							   "the table has data on some of the new segments, "
+							   "but these new segments are invisible and inaccessible to current transaction."),
+					 errhint("Re-run the query in a new transaction.")));
+		}
 
 		switch (policyform->policytype)
 		{
@@ -676,6 +699,13 @@ checkPolicyForUniqueIndex(Relation rel, AttrNumber *indattr, int nidxatts,
 	TupleDesc	desc = RelationGetDescr(rel);
 
 	/*
+	 * POLICYTYPE_ENTRY normally means it's a system table or a table created
+	 * in utility mode, so unique/primary key is allowed anywhere.
+	 */
+	if (GpPolicyIsEntry(rel->rd_cdbpolicy))
+		return;
+
+	/*
 	 * Firstly, unique/primary key indexes aren't supported if we're
 	 * distributing randomly.
 	 */
@@ -687,9 +717,11 @@ checkPolicyForUniqueIndex(Relation rel, AttrNumber *indattr, int nidxatts,
 						isprimary ? "PRIMARY KEY" : "UNIQUE")));
 	}
 
-	/* replicated table support unique/primary key indexes */
+	/* Replicated table support unique/primary key indexes */
 	if (GpPolicyIsReplicated(rel->rd_cdbpolicy))
 		return;
+
+	Assert(GpPolicyIsHashPartitioned(rel->rd_cdbpolicy));
 
 	/*
 	 * We use bitmaps to make intersection tests easier. As noted, order is
