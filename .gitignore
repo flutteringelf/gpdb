@@ -64,3 +64,12 @@ lib*.pc
 /Debug/
 /Release/
 /CMakeLists.txt
+depends/.conan
+depends/build
+src/test/regress
+depends/conan_imports_manifest.txt
+depends/conanbuildinfo.txt
+depends/conaninfo.txt
+depends/config.status
+depends/graph_info.json
+depends/Makefile
