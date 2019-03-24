@@ -15,21 +15,21 @@
 ## -------------------- ##
 ## M4sh Initialization. ##
 ## -------------------- ##
-rm -Rf /usr/local/gpdb
+sudo rm -Rf /usr/local/gpdb
 make distclean
 cd depends
 make distclean
 ./configure
 make
 make install_local
-mkdir -p /usr/local/gpdb
-cp -R -L build/* /usr/local/gpdb
+sudo mkdir -p /usr/local/gpdb
+sudo cp -R -L build/* /usr/local/gpdb
 cd ..
 
 
 ./configure --with-perl --with-python --with-libxml --with-gssapi --prefix=/usr/local/gpdb
 make -j8
-make -j8 install
+sudo make -j8 install
 
 
 source /usr/local/gpdb/greenplum_path.sh
